@@ -4,7 +4,9 @@ import torch
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
-
+from wan.modules.causal_model import CausalWanModel, CausalWanAttentionBlock, CausalWanSelfAttention
+from wan.utils.attn_map import Counter
+import logging
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -43,6 +45,23 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+        self.counter = Counter()
+        if isinstance(self.generator.model, CausalWanModel):
+            self.generator.model.apply(
+                lambda m: setattr(m, "counter", self.counter) if isinstance(m, CausalWanSelfAttention) else None
+            )
+
+        self.warp_functions()
+
+    def warp_functions(self):
+        old_forward = CausalWanSelfAttention.forward
+        def casual_block_forward(attn_self, *args, **kwargs):
+            if hasattr(attn_self, "counter"):
+                attn_self.counter.block += 1
+            return old_forward(attn_self, *args, **kwargs)
+        CausalWanSelfAttention.forward = casual_block_forward
+        print("insert counter")
 
     def inference(
         self,
@@ -178,6 +197,8 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
         for current_num_frames in all_num_frames:
+            self.counter.cur_frame += 1
+            print(f"Current frame: {self.counter.cur_frame}")
             if profile:
                 block_start.record()
 
@@ -187,6 +208,7 @@ class CausalInferencePipeline(torch.nn.Module):
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
                 print(f"current_timestep: {current_timestep}")
+                self.counter.time_step = current_timestep
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -219,6 +241,7 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                self.counter.block = 0
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
@@ -242,6 +265,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
+        self.counter.cur_frame = 0
 
         if profile:
             # End diffusion timing and synchronize CUDA

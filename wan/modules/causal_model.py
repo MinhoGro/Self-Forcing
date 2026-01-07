@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from wan.utils.attn_map import attn_map, Counter
+import logging
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -231,6 +233,16 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
                 kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             )
+            if hasattr(self, "Counter") or hasattr(self, "counter"):
+                attn_map(
+                    self.counter,
+                    roped_query,
+                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                )
+                # print(f'block {self.counter.block}')
+            else:
+                print("insert counter failed!")
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
