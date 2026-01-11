@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
-from wan.utils.attn_map import attn_map, Counter
+from wan.utils.attn_map import attn_map, line_attn_map, line_attn_score
 import logging
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
@@ -234,7 +234,7 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             )
             if hasattr(self, "Counter") or hasattr(self, "counter"):
-                attn_map(
+                line_attn_score(
                     self.counter,
                     roped_query,
                     kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
@@ -245,6 +245,23 @@ class CausalWanSelfAttention(nn.Module):
                 print("insert counter failed!")
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
+
+        # mask heads
+        head_mask_cfg = getattr(self.__class__, "head_mask", None)
+        if head_mask_cfg and hasattr(self, "counter") and self.counter is not None:
+            block_id = getattr(self.counter, "block", 0)
+            heads_to_zero = head_mask_cfg.get(block_id, None)
+
+            if heads_to_zero:
+                # x shape [B, T, H, Dh]
+                H = x.shape[2]
+                # print(f"block:{self.counter.block}, x.shape: {x.shape}, masked heads: {heads_to_zero}")
+                valid_heads = [h for h in heads_to_zero if 0 <= h < H]
+
+                if valid_heads:
+                    m = torch.ones(H, device=x.device, dtype=x.dtype)
+                    m[valid_heads] = 0
+                    x = x * m.view(1, 1, H, 1)
 
         # output
         x = x.flatten(2)

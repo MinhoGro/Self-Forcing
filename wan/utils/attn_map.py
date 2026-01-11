@@ -11,6 +11,8 @@ class Counter:
 import os
 import math
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
 
 def attn_map(counter, q, k, v, *, out_root="attn_vis", chunk_k=1024, eps=1e-12):
     """
@@ -176,6 +178,287 @@ def attn_map(counter, q, k, v, *, out_root="attn_vis", chunk_k=1024, eps=1e-12):
                     import imageio.v2 as imageio
                     imageio.imwrite(out_path, img)
 
+    return None
+
+
+def _to_bhnd(x: torch.Tensor) -> torch.Tensor:
+    """
+    Try to coerce x into [B, H, N, D].
+    Common cases:
+      - [B, H, N, D] (already)
+      - [B, N, H, D]
+      - [H, N, D]   (no batch)
+      - [N, H, D]   (no batch)
+    """
+    if x.dim() == 4:
+        B, a, b, D = x.shape
+        # Heuristic: head dim usually <= 32 and token dim usually larger
+        if a <= 64 and b > a:
+            # [B, H, N, D]
+            return x
+        if b <= 64 and a > b:
+            # [B, N, H, D] -> [B, H, N, D]
+            return x.permute(0, 2, 1, 3).contiguous()
+        # Fallback: assume [B, H, N, D]
+        return x
+
+    if x.dim() == 3:
+        a, b, D = x.shape
+        # [H, N, D]
+        if a <= 64 and b > a:
+            return x.unsqueeze(0)  # [1, H, N, D]
+        # [N, H, D]
+        if b <= 64 and a > b:
+            return x.permute(1, 0, 2).unsqueeze(0).contiguous()
+        # Fallback: treat first as H
+        return x.unsqueeze(0)
+
+    raise ValueError(f"Unsupported tensor rank: {x.dim()} for shape {tuple(x.shape)}")
+
+
+"""
+deep forcing style attention map
+"""
+@torch.no_grad()
+def line_attn_map(counter, q, k, v,
+             tokens_per_frame: int = 1560,
+             out_root: str = ".",
+             exclude_query_frames_from_keys: bool = True,
+             max_query_tokens: int | None = None):
+    """
+    Reproduce Deep Forcing-style "attention distribution across earlier frames":
+      For each head: average attention *logits* from all query tokens to each key-frame's tokens,
+      producing a 1D curve over key frames.
+
+    Args:
+      counter: has .cur_frame, .time_step, .block
+      q,k,v: projected tensors (before softmax attention), any of the supported shapes
+      tokens_per_frame: paper uses 1560 tokens/frame in latent patch layout
+      exclude_query_frames_from_keys: if k contains the same chunk's tokens, drop the last q_frames from keys
+      max_query_tokens: optional subsample of query tokens for speed (strided)
+    """
+    if counter.cur_frame < 19:
+        return
+
+    if counter.time_step > 625:
+        return
+
+    print(f"frame:{counter.cur_frame}, time:{counter.time_step}, block:{counter.block}")
+
+    q = _to_bhnd(q)
+    k = _to_bhnd(k)
+
+    device = q.device
+    q = q.float()
+    k = k.float()
+
+    B, H, Q, D = q.shape
+    _, _, K, _ = k.shape
+
+    # Optional query subsample (keeps plot stable but faster)
+    if max_query_tokens is not None and Q > max_query_tokens:
+        idx = torch.linspace(0, Q - 1, steps=max_query_tokens, device=device).long()
+        q = q[:, :, idx, :]
+        Q = q.shape[2]
+
+    # Estimate how many frames are inside q (only used to exclude keys)
+    q_frames = max(1, Q // tokens_per_frame) if (Q % tokens_per_frame == 0) else 1
+    k_frames_total = max(1, math.ceil(K / tokens_per_frame))
+
+    # Optionally exclude "current chunk" keys so the curve is only over earlier frames (like the paper fig)
+    if exclude_query_frames_from_keys and k_frames_total > q_frames:
+        keep_frames = k_frames_total - q_frames
+        K_use = min(K, keep_frames * tokens_per_frame)
+    else:
+        K_use = K
+
+    # F = max(1, math.ceil(K_use / tokens_per_frame))
+    scale = 1.0 / math.sqrt(D)
+
+    # Prepare output directory: ./cur_frame/block/hX.png
+    out_dir = os.path.join(out_root, str(counter.cur_frame), str(counter.block))
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Precompute per-head q_sum to avoid huge QxK matmuls:
+    # sum_{q,k} (q·k) = (sum_q q) · (sum_k k)  (per batch), then sum over batch.
+    # This reproduces mean of pre-softmax logits over all (query token, key token) pairs in a frame.
+    q_sum = q.sum(dim=2)  # [B, H, D]
+
+    # Loop heads and frames
+    for h in range(H):
+        # y 的长度是 K_use：每个 key token 一个点
+        y = np.empty(K_use, dtype=np.float32)
+
+        qh_sum = q_sum[:, h, :]  # [B, D]
+
+        # 分块算，避免一次性吃太多显存
+        chunk = 8192
+        for s in range(0, K_use, chunk):
+            e = min(K_use, s + chunk)
+
+            # kh: [B, Tk, D]
+            kh = k[:, h, s:e, :]
+
+            # 对每个 key token j：score_j = mean_{b,q} (q·k_j)/sqrt(D)
+            # 利用 sum_q：mean_{q}(q·k) = (sum_q q)·k / Q
+            # scores_bj = (qh_sum_b · kh_bj) / (Q*sqrt(D))  -> [B, Tk]
+            scores = (kh * qh_sum[:, None, :]).sum(dim=-1) * (scale / max(Q, 1))
+
+            # 再对 batch 平均：-> [Tk]
+            scores = scores.mean(dim=0)
+
+            y[s:e] = scores.detach().float().cpu().numpy()
+
+        # Plot (line + filled area), matching the paper vibe
+        x = np.arange(K_use)
+        plt.figure(figsize=(6.0, 3.2))
+        plt.plot(x, y, linewidth=0.5)
+        plt.fill_between(x, y, alpha=0.25)
+        plt.xlabel("Key Tokens (flattened by time)")
+        plt.ylabel("Query-avg Attn Logit (per token)")
+        plt.title(f"L{counter.block} H{h}  (t={counter.time_step}, cur={counter.cur_frame})")
+        plt.tight_layout()
+
+        out_path = os.path.join(out_dir, f"h{h}.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+
+    # 这个函数通常只做 side-effect 可视化，不改变前向
+    return None
+
+"""
+deep forcing style attention score
+"""
+@torch.no_grad()
+def line_attn_score(counter, q, k, v,
+             tokens_per_frame: int = 1560,
+             out_root: str = ".",
+             exclude_query_frames_from_keys: bool = True,
+             max_query_tokens: int | None = None):
+    """
+    Reproduce Deep Forcing-style "attention distribution across earlier frames":
+      For each head: average attention *logits* from all query tokens to each key-frame's tokens,
+      producing a 1D curve over key frames.
+
+    Args:
+      counter: has .cur_frame, .time_step, .block
+      q,k,v: projected tensors (before softmax attention), any of the supported shapes
+      tokens_per_frame: paper uses 1560 tokens/frame in latent patch layout
+      exclude_query_frames_from_keys: if k contains the same chunk's tokens, drop the last q_frames from keys
+      max_query_tokens: optional subsample of query tokens for speed (strided)
+    """
+    if counter.cur_frame < 20:
+        return
+
+    if counter.time_step > 625:
+        return
+
+    print(f"frame:{counter.cur_frame}, time:{counter.time_step}, block:{counter.block}")
+
+    q = _to_bhnd(q)
+    k = _to_bhnd(k)
+
+    device = q.device
+    q = q.float()
+    k = k.float()
+
+    B, H, Q, D = q.shape
+    _, _, K, _ = k.shape
+
+    # Optional query subsample (keeps plot stable but faster)
+    if max_query_tokens is not None and Q > max_query_tokens:
+        idx = torch.linspace(0, Q - 1, steps=max_query_tokens, device=device).long()
+        q = q[:, :, idx, :]
+        Q = q.shape[2]
+
+    # Estimate how many frames are inside q (only used to exclude keys)
+    q_frames = max(1, Q // tokens_per_frame) if (Q % tokens_per_frame == 0) else 1
+    k_frames_total = max(1, math.ceil(K / tokens_per_frame))
+
+    # Optionally exclude "current chunk" keys so the curve is only over earlier frames (like the paper fig)
+    if exclude_query_frames_from_keys and k_frames_total > q_frames:
+        keep_frames = k_frames_total - q_frames
+        K_use = min(K, keep_frames * tokens_per_frame)
+    else:
+        K_use = K
+
+    # F = max(1, math.ceil(K_use / tokens_per_frame))
+    scale = 1.0 / math.sqrt(D)
+
+    # Prepare output directory: ./cur_frame/block/hX.png
+    out_dir = os.path.join(out_root, str(counter.cur_frame), str(counter.block))
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Precompute per-head q_sum to avoid huge QxK matmuls:
+    # sum_{q,k} (q·k) = (sum_q q) · (sum_k k)  (per batch), then sum over batch.
+    # This reproduces mean of pre-softmax logits over all (query token, key token) pairs in a frame.
+    q_sum = q.sum(dim=2)  # [B, H, D]
+
+    # Loop heads
+    for h in range(H):
+        y = np.empty(K_use, dtype=np.float32)
+
+        qh = q[:, h, :, :]  # [B, Q, D]
+
+        chunk = 8192
+
+        # ---- Pass 1: global max over ALL keys (for stable softmax) ----
+        max_logit = torch.full((B, Q), -float("inf"), device=device, dtype=qh.dtype)
+        for s in range(0, K_use, chunk):
+            e = min(K_use, s + chunk)
+            kh = k[:, h, s:e, :]  # [B, Tk, D]
+
+            # logits: [B, Q, Tk]
+            logits = torch.einsum("bqd,bkd->bqk", qh, kh) * scale
+            max_logit = torch.maximum(max_logit, logits.max(dim=-1).values)
+
+        # ---- Pass 2: global denom over ALL keys ----
+        denom = torch.zeros((B, Q), device=device, dtype=qh.dtype)
+        for s in range(0, K_use, chunk):
+            e = min(K_use, s + chunk)
+            kh = k[:, h, s:e, :]  # [B, Tk, D]
+            logits = torch.einsum("bqd,bkd->bqk", qh, kh) * scale
+            denom = denom + torch.exp(logits - max_logit.unsqueeze(-1)).sum(dim=-1)
+
+        # Avoid divide-by-zero (shouldn't happen, but safe)
+        denom = denom.clamp_min(1e-12)
+
+        # ---- Pass 3: compute weights + "vote" per key token ----
+        for s in range(0, K_use, chunk):
+            e = min(K_use, s + chunk)
+            kh = k[:, h, s:e, :]  # [B, Tk, D]
+            logits = torch.einsum("bqd,bkd->bqk", qh, kh) * scale
+
+            # softmax weights: [B, Q, Tk]
+            w = torch.exp(logits - max_logit.unsqueeze(-1)) / denom.unsqueeze(-1)
+
+            # "vote score" per key token = sum over queries (current frame tokens)
+            # -> [B, Tk]
+            vote = w.sum(dim=1)
+
+            # optional: if you want query-AVERAGE vote instead of sum, use:
+            # vote = w.mean(dim=1)
+
+            # batch average -> [Tk]
+            vote = vote.mean(dim=0)
+
+            y[s:e] = vote.detach().float().cpu().numpy()
+
+        # Plot (line + filled area), matching the paper vibe
+        x = np.arange(K_use)
+        plt.figure(figsize=(6.0, 3.2))
+        plt.plot(x, y, linewidth=0.5)
+        plt.fill_between(x, y, alpha=0.25)
+        plt.xlabel("Key Tokens (flattened by time)")
+        plt.ylabel("Query-avg Attn Logit (per token)")
+        plt.title(f"L{counter.block} H{h}  (t={counter.time_step}, cur={counter.cur_frame})")
+        plt.tight_layout()
+
+        out_path = os.path.join(out_dir, f"h{h}.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+
+    # 这个函数通常只做 side-effect 可视化，不改变前向
     return None
 
 """

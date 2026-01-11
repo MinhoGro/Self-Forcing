@@ -63,6 +63,15 @@ class CausalInferencePipeline(torch.nn.Module):
         CausalWanSelfAttention.forward = casual_block_forward
         print("insert counter")
 
+        # # Insert attention head mask
+        # CausalWanSelfAttention.head_mask = {
+        #     26:[1,2,7],
+        #     27:[1,4],
+        #     28:[1,4,5],
+        #     29:[4,7],
+        #     30:[10,11],
+        # }
+
     def inference(
         self,
         noise: torch.Tensor,
@@ -209,6 +218,7 @@ class CausalInferencePipeline(torch.nn.Module):
             for index, current_timestep in enumerate(self.denoising_step_list):
                 print(f"current_timestep: {current_timestep}")
                 self.counter.time_step = current_timestep
+                self.counter.block = 0
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -241,7 +251,7 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
-                self.counter.block = 0
+            self.counter.time_step = 1000
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
