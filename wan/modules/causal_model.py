@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
-from wan.utils.attn_map import attn_map, line_attn_map, line_attn_score
+from wan.utils.attn_map import attn_map, line_attn_map, line_attn_score, graph_attn_score
 import logging
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
@@ -234,7 +234,7 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             )
             if hasattr(self, "Counter") or hasattr(self, "counter"):
-                line_attn_score(
+                graph_attn_score(
                     self.counter,
                     roped_query,
                     kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],

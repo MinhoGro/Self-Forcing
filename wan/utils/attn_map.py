@@ -327,7 +327,8 @@ def line_attn_map(counter, q, k, v,
     return None
 
 """
-deep forcing style attention score
+deep forcing style,
+attention score graph
 """
 @torch.no_grad()
 def line_attn_score(counter, q, k, v,
@@ -347,7 +348,7 @@ def line_attn_score(counter, q, k, v,
       exclude_query_frames_from_keys: if k contains the same chunk's tokens, drop the last q_frames from keys
       max_query_tokens: optional subsample of query tokens for speed (strided)
     """
-    if counter.cur_frame < 20:
+    if counter.cur_frame < 21:
         return
 
     if counter.time_step > 625:
@@ -395,6 +396,21 @@ def line_attn_score(counter, q, k, v,
     q_sum = q.sum(dim=2)  # [B, H, D]
 
     # Loop heads
+    y_sum = np.zeros(K_use, dtype=np.float32)
+
+    def plot_y(x, y, h):
+        # Plot (line + filled area), matching the paper vibe
+        plt.figure(figsize=(6.0, 3.2))
+        plt.plot(x, y, linewidth=0.5)
+        plt.fill_between(x, y, alpha=0.25)
+        plt.xlabel("Key Tokens (flattened by time)")
+        plt.ylabel("Query-avg Attn Logit (per token)")
+        plt.title(f"L{counter.block} H{h}  (t={counter.time_step}, cur={counter.cur_frame})")
+        plt.tight_layout()
+        out_path = os.path.join(out_dir, f"h{h}.png")
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+
     for h in range(H):
         y = np.empty(K_use, dtype=np.float32)
 
@@ -441,25 +457,117 @@ def line_attn_score(counter, q, k, v,
 
             # batch average -> [Tk]
             vote = vote.mean(dim=0)
-
             y[s:e] = vote.detach().float().cpu().numpy()
 
-        # Plot (line + filled area), matching the paper vibe
-        x = np.arange(K_use)
-        plt.figure(figsize=(6.0, 3.2))
-        plt.plot(x, y, linewidth=0.5)
-        plt.fill_between(x, y, alpha=0.25)
-        plt.xlabel("Key Tokens (flattened by time)")
-        plt.ylabel("Query-avg Attn Logit (per token)")
-        plt.title(f"L{counter.block} H{h}  (t={counter.time_step}, cur={counter.cur_frame})")
-        plt.tight_layout()
+        y_sum = y_sum + y
+        plot_y(np.arange(K_use), y, h)
 
-        out_path = os.path.join(out_dir, f"h{h}.png")
-        plt.savefig(out_path, dpi=200)
-        plt.close()
+    plot_y(np.arange(K_use), y_sum, 12)
 
     # 这个函数通常只做 side-effect 可视化，不改变前向
     return None
+
+
+def _to_bhqd(x: torch.Tensor) -> torch.Tensor:
+    """
+    Try to normalize q/k/v into shape [B, H, S, D].
+    Common cases:
+      - [B, H, S, D]
+      - [B, S, H, D]
+    """
+    if x is None:
+        return None
+    if x.dim() != 4:
+        raise ValueError(f"Expected 4D tensor for q/k/v, got shape={tuple(x.shape)}")
+
+    B, A, B_or_S, D = x.shape
+    # Heuristic: head count is usually <= 128, sequence length usually much larger.
+    if A <= 128 and B_or_S > A:
+        # [B, H, S, D]
+        return x
+    if B_or_S <= 128 and A > B_or_S:
+        # [B, S, H, D] -> [B, H, S, D]
+        return x.permute(0, 2, 1, 3).contiguous()
+
+    # Fallback: assume already [B,H,S,D]
+    return x
+
+
+@torch.no_grad()
+def graph_attn_score(counter, q, k, v):
+    # ===== keep your switches =====
+    if counter.cur_frame < 21:
+        return
+    if counter.time_step > 625:
+        return
+
+    # ===== output root (you can override via env var) =====
+    out_root = os.environ.get("ATTN_SCORE_ROOT", "attn_score_fig2")
+    frame_dir = os.path.join(out_root, f"t{int(counter.time_step):04d}/frame_{int(counter.cur_frame):04d}/layer{int(counter.block):02d}")
+    os.makedirs(frame_dir, exist_ok=True)
+
+    # ===== normalize shapes =====
+    q = _to_bhqd(q)
+    k = _to_bhqd(k)
+
+    # pick first sample in batch
+    qb = q[0]  # [H, Q, D]
+    kb = k[0]  # [H, K, D]
+
+    H, Q, D = qb.shape
+    _, K, _ = kb.shape
+
+    # evenly spaced indices (deterministic,方便复现)
+    q_idx = torch.arange(Q, device=qb.device)
+    k_idx = torch.arange(K, device=kb.device)
+
+    # ===== plot per-head heatmap =====
+    # IMPORTANT: do imports here so this function doesn't force matplotlib on every run unless it triggers
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    scale = 1.0 / math.sqrt(D)
+
+    for h in range(H):
+        qh = qb[h].index_select(0, q_idx).float()  # [qn, D]
+        kh = kb[h].index_select(0, k_idx).float()  # [kn, D]
+
+        # attention logits + softmax over keys
+        logits = (qh @ kh.transpose(0, 1)) * scale          # [qn, kn]
+        attn = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+
+        # Make the visualization more “pattern-revealing”
+        # (optional) clamp tiny values for contrast; keep mild so it doesn’t lie.
+        # attn = np.clip(attn, 0.0, np.quantile(attn, 0.999))
+
+        plt.figure(figsize=(10, 4))
+        # robust color scaling via quantiles
+        vmin = np.quantile(attn, 0.05)
+        vmax = np.quantile(attn, 0.995)
+        attn_vis = np.power(attn, 0.995)  # sqrt stretch
+
+        plt.imshow(attn_vis,
+                   aspect="auto",
+                   interpolation="nearest",
+                   cmap="cividis",
+                    vmin = vmin,
+                    vmax = vmax,
+                )
+        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.title(
+            f"Attn Pattern | frame={counter.cur_frame} | t={counter.time_step} | layer={counter.block} | head={h}"
+        )
+        plt.xlabel("Key token index (sampled)")
+        plt.ylabel("Query token index (sampled)")
+
+        save_path = os.path.join(
+            frame_dir,
+            f"h{h:02d}.png"
+        )
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+
 
 """
 python inference.py \

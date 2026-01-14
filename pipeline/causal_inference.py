@@ -69,7 +69,7 @@ class CausalInferencePipeline(torch.nn.Module):
         #     27:[1,4],
         #     28:[1,4,5],
         #     29:[4,7],
-        #     30:[10,11],
+        #     30:[2,7],
         # }
 
     def inference(
