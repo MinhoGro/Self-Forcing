@@ -238,6 +238,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         logits = None
         # X0 prediction
         if kv_cache is not None:
+            print(f"self forcing wan2.1. ")
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,

@@ -8,6 +8,13 @@ from wan.modules.causal_model import CausalWanModel, CausalWanAttentionBlock, Ca
 from wan.utils.attn_map import Counter
 import logging
 
+"""
+compensate noisy when length increasing.
+"""
+def noise_filling(noisy_input):
+    noisy_input2 = torch.randn_like(noisy_input, device=noisy_input.device, dtype=torch.bfloat16)
+    return [noisy_input,noisy_input2]
+
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
             self,
@@ -47,14 +54,20 @@ class CausalInferencePipeline(torch.nn.Module):
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
         self.counter = Counter()
-        if isinstance(self.generator.model, CausalWanModel):
-            self.generator.model.apply(
-                lambda m: setattr(m, "counter", self.counter) if isinstance(m, CausalWanSelfAttention) else None
-            )
+        # if isinstance(self.generator.model, CausalWanModel):
+        #     self.generator.model.apply(
+        #         lambda m: setattr(m, "counter", self.counter) if isinstance(m, CausalWanSelfAttention) else None
+        #     )
 
-        self.warp_functions()
+        # self.warp_functions(warp=False)
 
-    def warp_functions(self):
+    def warp_functions(self, warp=True):
+        """
+        inject warp functions from anywhere.
+        """
+        if warp is False:
+            return
+
         old_forward = CausalWanSelfAttention.forward
         def casual_block_forward(attn_self, *args, **kwargs):
             if hasattr(attn_self, "counter"):
@@ -211,12 +224,15 @@ class CausalInferencePipeline(torch.nn.Module):
             if profile:
                 block_start.record()
 
+            if (current_start_frame + current_num_frames - num_input_frames) > noise.shape[1]:
+                noisy_input = noise_filling(noisy_input)
+
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
-                print(f"current_timestep: {current_timestep}")
+                # print(f"current_timestep: {current_timestep}")
                 self.counter.time_step = current_timestep
                 self.counter.block = 0
                 # set current timestep
@@ -285,8 +301,13 @@ class CausalInferencePipeline(torch.nn.Module):
             init_time = init_start.elapsed_time(init_end)
             vae_start.record()
 
-        # Step 4: Decode the output
-        video = self.vae.decode_to_pixel(output, use_cache=False)
+        # Step 4: Decode the output (chunked over time to reduce peak VRAM during VAE decode)
+        decode_chunk_size = getattr(self.args, "decode_chunk_size", 21)
+        video_chunks = []
+        for s in range(0, output.shape[1], decode_chunk_size):
+            v = self.vae.decode_to_pixel(output[:, s:s + decode_chunk_size], use_cache=False)
+            video_chunks.append(v)
+        video = torch.cat(video_chunks, dim=1)
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
         if profile:

@@ -85,6 +85,63 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    @staticmethod
+    def delta_rope_apply_time_inplace(
+        k_slice: torch.Tensor,
+        freqs: torch.Tensor,
+        delta_frames: int,
+    ) -> None:
+        """Apply a *time-axis only* RoPE shift to an already-RoPE'd key tensor.
+
+        This is used after FIFO / rolling eviction when you re-anchor RoPE positions to a sliding window.
+
+        For unit-modulus complex RoPE multipliers (as used by `causal_rope_apply`):
+            K_rope(t - Δ) = K_rope(t) * conj(freq_time[Δ])
+
+        Args:
+            k_slice: [B, L, H, Dh] slice of kv_cache["k"] to be corrected in-place.
+            freqs:   [max_frames, Dh/2] complex RoPE multipliers (packed as [time|h|w] along dim=1).
+            delta_frames: how many *frames* were evicted / shifted left.
+        """
+        if delta_frames <= 0:
+            return
+
+        head_dim = k_slice.shape[-1]
+        assert head_dim % 2 == 0, "RoPE expects an even head_dim."
+
+        # `c` is the number of complex pairs along the last dim.
+        c = head_dim // 2
+        # 3D RoPE packing: [time | h | w] in *complex* dims.
+        time_c = c - 2 * (c // 3)
+        if time_c <= 0:
+            return
+
+        # Time-axis freqs are the first `time_c` complex dims.
+        freqs_time = freqs[:, :time_c]
+        if delta_frames >= freqs_time.shape[0]:
+            raise ValueError(
+                f"delta_frames={delta_frames} exceeds freqs_time length={freqs_time.shape[0]}"
+            )
+
+        # Inverse of a unit-modulus complex number is its conjugate.
+        delta_mult = torch.conj(freqs_time[delta_frames]).to(device=k_slice.device)
+
+        # Apply only to the *time* rotary part (first 2*time_c real dims).
+        kt = k_slice[..., : 2 * time_c]
+
+        # torch.view_as_complex only supports float32/float64 and requires last-dim stride==1.
+        kt_f = kt.to(torch.float32).contiguous().view(*kt.shape[:-1], time_c, 2)
+        kt_c = torch.view_as_complex(kt_f)  # [..., time_c]
+
+        kt_c = kt_c * delta_mult.view(1, 1, 1, -1)
+
+        kt_out = (
+            torch.view_as_real(kt_c)
+            .view(*kt.shape[:-1], 2 * time_c)
+            .to(dtype=k_slice.dtype)
+        )
+
+        k_slice[..., : 2 * time_c] = kt_out
     def forward(
         self,
         x,
@@ -194,26 +251,56 @@ class CausalWanSelfAttention(nn.Module):
                 )[:, :, :-padded_length].transpose(2, 1)
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            local_start_frame = kv_cache["local_end_index"].item() // frame_seqlen + 1
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                q, grid_sizes, freqs, start_frame=local_start_frame).type_as(v)
             roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                k, grid_sizes, freqs, start_frame=local_start_frame).type_as(v)
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+            # print(f'current_end: {current_end}, global_end_index:{kv_cache["global_end_index"].item()}')
+            # print(f'num_new_tokens: {num_new_tokens}, local_end_index: {kv_cache["local_end_index"].item()}, kv_cache_size: {kv_cache_size}')
+            # print(f'self.local_attn_size: {self.local_attn_size}')
+            # if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+            if (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+                # Compute eviction in tokens, then round *up* to a frame-aligned amount.
+                raw_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+
+                # Ceil-div to frames: delta_frames = ceil(raw_evicted_tokens / frame_seqlen)
+                delta_frames = (raw_evicted_tokens + frame_seqlen - 1) // frame_seqlen
+                num_evicted_tokens = delta_frames * frame_seqlen
+
+                # Safety: never evict sink tokens; cap eviction to what is actually evictable (frame-aligned).
+                max_evictable = kv_cache["local_end_index"].item() - sink_tokens
+                max_evictable_aligned = (max_evictable // frame_seqlen) * frame_seqlen
+                if num_evicted_tokens > max_evictable_aligned:
+                    num_evicted_tokens = max_evictable_aligned
+                    delta_frames = num_evicted_tokens // frame_seqlen
+
+                if num_evicted_tokens != raw_evicted_tokens:
+                    logging.info(
+                        f"Eviction rounded up for frame alignment: raw={raw_evicted_tokens} -> aligned={num_evicted_tokens} "
+                        f"(frame_seqlen={frame_seqlen}, delta_frames={delta_frames})."
+                    )
+
                 num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+
                 kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+
+                # Re-anchor RoPE after rolling: shift the *time-axis* rotary phase by the number of evicted frames.
+                if delta_frames > 0:
+                    self.delta_rope_apply_time_inplace(
+                        kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens],
+                        freqs=freqs,
+                        delta_frames=delta_frames,
+                    )
                 kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 # Insert the new keys/values at the end
@@ -241,8 +328,6 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
                 )
                 # print(f'block {self.counter.block}')
-            else:
-                print("insert counter failed!")
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 

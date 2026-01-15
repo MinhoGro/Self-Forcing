@@ -158,9 +158,19 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             prompts = [prompt] * args.num_samples
         initial_latent = None
 
-        sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
-        )
+        # 固定采样 21 帧noise，后续循环利用
+        sampled_noise = []
+        if args.num_output_frames <= 21:
+            sampled_noise = torch.randn(
+                [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+            )
+        else:
+            init_noise = torch.randn(
+                [args.num_samples, 21, 16, 60, 104], device=device, dtype=torch.bfloat16
+            )
+            # Repeat the 21-frame init_noise along time until reaching args.num_output_frames, then truncate.
+            repeat_times = (args.num_output_frames + 21 - 1) // 21
+            sampled_noise = init_noise.repeat(1, repeat_times, 1, 1, 1)[:, :args.num_output_frames]
 
     # Generate 81 frames
     video, latents = pipeline.inference(
