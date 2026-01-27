@@ -106,6 +106,7 @@ if local_rank == 0:
 if dist.is_initialized():
     dist.barrier()
 
+perm=None
 
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
     device, dtype = videos[0].device, videos[0].dtype
@@ -158,27 +159,33 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             prompts = [prompt] * args.num_samples
         initial_latent = None
 
-        # 固定采样 21 帧noise，后续循环利用
         sampled_noise = []
         if args.seed is None:
             seed = 16295040505346244121
         g = torch.Generator(device=device).manual_seed(args.seed)
         if args.num_output_frames <= 21:
             sampled_noise = torch.randn(
-                [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16, generator=g
+                [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
             )
             print(f"\ngenerator seed: {g.initial_seed()}")
         else:
+            init_roll_block = 9
             init_noise = torch.randn(
-                [args.num_samples, 21, 16, 60, 104], device=device, dtype=torch.bfloat16, generator=g
+                [args.num_samples, init_roll_block, 16, 60, 104], device=device, dtype=torch.bfloat16, generator=g
             )
-            s = torch.Generator(device=device).manual_seed(torch.seed())
-            perm = torch.randperm(21, device=device, generator=s)
-            print(f"permutation order: {perm}")
-            init_noise = init_noise[:, perm]
+            # s = torch.Generator(device=device).manual_seed(torch.seed())
+            # perm = torch.randperm(init_roll_block, device=device, generator=s)
+            # print(f"permutation order: {perm}")
+            # init_noise = init_noise[:, perm]
             # Repeat the 21-frame init_noise along time until reaching args.num_output_frames, then truncate.
-            repeat_times = (args.num_output_frames + 21 - 1) // 21
+            repeat_times = (args.num_output_frames + init_roll_block - 1) // init_roll_block
             sampled_noise = init_noise.repeat(1, repeat_times, 1, 1, 1)[:, :args.num_output_frames]
+            for i in range(repeat_times-1):
+                print(f"i: {i}, init_roll_block: {init_roll_block}")
+                sampled_noise[:, i*init_roll_block:(i+1)*init_roll_block] = torch.randn(
+                        [args.num_samples, init_roll_block, 16, 60, 104], device=device, dtype=torch.bfloat16, generator=g
+                )
+            sampled_noise = sampled_noise[:, :args.num_output_frames]
 
     # Generate 81 frames
     video, latents = pipeline.inference(
@@ -204,7 +211,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         for seed_idx in range(args.num_samples):
             # All processes save their videos
             if args.save_with_index:
-                output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
+                output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}_{perm}.mp4')
             else:
-                output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}.mp4')
+                output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}_{perm}.mp4')
             write_video(output_path, video[seed_idx], fps=16)

@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional
 import torch
 
@@ -6,6 +7,7 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 from wan.modules.causal_model import CausalWanModel, CausalWanAttentionBlock, CausalWanSelfAttention
 from wan.utils.attn_map import Counter
+from wan.utils.freeinit_utils import freq_mix_3d, butterworth_low_pass_filter, gaussian_low_pass_filter, ideal_low_pass_filter, box_low_pass_filter
 import logging
 
 """
@@ -14,6 +16,41 @@ compensate noisy when length increasing.
 def noise_filling(noisy_input):
     noisy_input2 = torch.randn_like(noisy_input, device=noisy_input.device, dtype=torch.bfloat16)
     return [noisy_input,noisy_input2]
+
+
+import torch
+import matplotlib.pyplot as plt
+
+
+def show_spatial_fft(counter, x, b=0, t=0, c=0, isInput=False):
+    img = x[b, t, c]  # [H, W]
+    img = img.to(torch.float32)
+
+    freq = torch.fft.fft2(img)
+    freq = torch.fft.fftshift(freq)
+
+    amp = freq.abs()
+    amp = torch.log1p(amp)  # log可视化更稳定
+
+    if isInput:
+        local_path = f"./image/c{c}/input"
+        os.makedirs(local_path, exist_ok=True)
+    else:
+        local_path = f"./image/c{c}"
+        os.makedirs(local_path, exist_ok=True)
+
+    if counter.min==0 and counter.max==0:
+        print("Reset counter min max. ")
+        counter.min = amp.min().item()
+        counter.max = amp.max().item()
+
+    plt.figure(figsize=(5, 5))
+    plt.imshow(amp.cpu(), cmap='viridis', vmin=counter.min, vmax=counter.max)
+    plt.title(f"frame{counter.cur_frame} channel{c} ")
+    plt.axis('off')
+    plt.savefig(f"{local_path}/f{counter.cur_frame}-t{t}-r{counter.rep_step}.png")
+    plt.close()
+
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -218,6 +255,8 @@ class CausalInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
+
+        denoised_pred = None
         for current_num_frames in all_num_frames:
             self.counter.cur_frame += 1
             print(f"Current frame: {self.counter.cur_frame}")
@@ -227,46 +266,81 @@ class CausalInferencePipeline(torch.nn.Module):
             if (current_start_frame + current_num_frames - num_input_frames) > noise.shape[1]:
                 noisy_input = noise_filling(noisy_input)
 
-            noisy_input = noise[
-                :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
-
             # Step 3.1: Spatial denoising loop
-            for index, current_timestep in enumerate(self.denoising_step_list):
-                # print(f"current_timestep: {current_timestep}")
-                self.counter.time_step = current_timestep
-                self.counter.block = 0
-                # set current timestep
-                timestep = torch.ones(
-                    [batch_size, current_num_frames],
-                    device=noise.device,
-                    dtype=torch.int64) * current_timestep
+            for rep_step in range(1):
+                self.counter.rep_step = rep_step
+                noisy_input = noise[
+                          :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+                # if self.counter.cur_frame > 1 and rep_step > 0:
+                if self.counter.cur_frame > 1:
+                    b, t, c, h, w = noisy_input.shape
+                    timestep = self.denoising_step_list[0]
+                    # denoised_reverse = self.scheduler.add_noise(
+                    #     output[:, 0:3].flatten(0, 1),
+                    #     torch.randn_like(denoised_pred.flatten(0, 1)),
+                    #     timestep * torch.ones(
+                    #         [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                    # ).unflatten(0, denoised_pred.shape[:2])
+                    print(f"denoise reversed.")
+                    print(f"decoded_frame: {current_start_frame - num_input_frames}: {current_start_frame + current_num_frames - num_input_frames}")
+                    # noisy_input = freq_mix_3d(
+                    #     # output[:, 0:current_num_frames],
+                    #     denoised_reverse,
+                    #     noisy_input,
+                    #     butterworth_low_pass_filter(shape=[b, c, t, h, w], d_s=0.55, d_t=0.55)
+                    # )
+                    # noisy_input = denoised_reverse
+                    # for t in range(noisy_input.shape[1]):
+                    #     for c in range(noisy_input.shape[2]):
+                    #         show_spatial_fft(counter=self.counter,
+                    #                          x=noisy_input,
+                    #                          t=t,
+                    #                          c=c,
+                    #                          isInput=True,
+                    #                          )
+                for index, current_timestep in enumerate(self.denoising_step_list):
+                    # print(f"current_timestep: {current_timestep}")
+                    self.counter.time_step = current_timestep
+                    self.counter.block = 0
+                    # set current timestep
+                    timestep = torch.ones(
+                        [batch_size, current_num_frames],
+                        device=noise.device,
+                        dtype=torch.int64) * current_timestep
 
-                if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
-                    next_timestep = self.denoising_step_list[index + 1]
-                    noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep * torch.ones(
-                            [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
-                    ).unflatten(0, denoised_pred.shape[:2])
-                else:
-                    # for getting real output
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
+                    if index < len(self.denoising_step_list) - 1:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length
+                        )
+                        next_timestep = self.denoising_step_list[index + 1]
+                        noisy_input = self.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep * torch.ones(
+                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                        ).unflatten(0, denoised_pred.shape[:2])
+                    else:
+                        # for getting real output
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length
+                        )
+                        for t in range(denoised_pred.shape[1]):
+                            for c in range(denoised_pred.shape[2]):
+                                show_spatial_fft(counter=self.counter,
+                                                 x=denoised_pred,
+                                                 t=t,
+                                                 c=c,
+                                                 )
             self.counter.time_step = 1000
 
             # Step 3.2: record the model's output
@@ -274,6 +348,14 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            # b, t, c, h, w = denoised_pred.shape
+            # cache_input = freq_mix_3d(
+            #     # output[:, 0:current_num_frames],
+            #     x=denoised_pred,
+            #     noise=denoised_pred,
+            #     LPF=box_low_pass_filter(shape=[b, c, t, h, w], d_s=0.85, d_t=0.85),
+            #     isCache=True,
+            # )
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
@@ -302,12 +384,17 @@ class CausalInferencePipeline(torch.nn.Module):
             vae_start.record()
 
         # Step 4: Decode the output (chunked over time to reduce peak VRAM during VAE decode)
-        decode_chunk_size = getattr(self.args, "decode_chunk_size", 21)
-        video_chunks = []
-        for s in range(0, output.shape[1], decode_chunk_size):
-            v = self.vae.decode_to_pixel(output[:, s:s + decode_chunk_size], use_cache=False)
-            video_chunks.append(v)
-        video = torch.cat(video_chunks, dim=1)
+        chunck_decode = getattr(self.args, "chunk_decode", False)
+        if chunck_decode:
+            decode_chunk_size = getattr(self.args, "decode_chunk_size", 21)
+            video_chunks = []
+            for s in range(0, output.shape[1], decode_chunk_size):
+                v = self.vae.decode_to_pixel(output[:, s:s + decode_chunk_size], use_cache=False)
+                video_chunks.append(v)
+            video = torch.cat(video_chunks, dim=1)
+        else:
+            video = self.vae.decode_to_pixel(output, use_cache=False)
+
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
         if profile:

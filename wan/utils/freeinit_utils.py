@@ -3,7 +3,7 @@ import torch.fft as fft
 import math
 
 
-def freq_mix_3d(x, noise, LPF):
+def freq_mix_3d(x, noise, LPF, isCache=False):
     """
     Noise reinitialization.
 
@@ -21,8 +21,8 @@ def freq_mix_3d(x, noise, LPF):
     LPF = LPF.to(device=x.device, dtype=torch.float32)
 
     # reshape noise& latent
-    torch.permute(x, (0, 2, 1, 3, 4)) # [B,T,C,H,W] -> [B,C,T,H,W]
-    torch.permute(noise, (0, 2, 1, 3, 4))
+    x = x.permute(0, 2, 1, 3, 4) # [B,T,C,H,W] -> [B,C,T,H,W]
+    noise = noise.permute(0, 2, 1, 3, 4)
 
     x_freq = fft.fftn(x, dim=(-3, -2, -1))
     x_freq = fft.fftshift(x_freq, dim=(-3, -2, -1))
@@ -31,16 +31,22 @@ def freq_mix_3d(x, noise, LPF):
 
     # frequency mix
     HPF = 1 - LPF
+    # print(f"LPF shape: {LPF.shape}, x_freq shape: {x_freq.shape}, noise_freq shape: {noise_freq.shape}")
     x_freq_low = x_freq * LPF
+    x_freq_high = x_freq * LPF
+    noise_freq_low = noise_freq * LPF
     noise_freq_high = noise_freq * HPF
-    x_freq_mixed = x_freq_low + noise_freq_high # mix in freq domain
+    if isCache:
+        x_freq_mixed = x_freq_low # mix in freq domain
+    else:
+        x_freq_mixed = noise_freq_high + 0.8*x_freq_low + 0.2*noise_freq_low
 
     # IFFT
     x_freq_mixed = fft.ifftshift(x_freq_mixed, dim=(-3, -2, -1))
     x_mixed = fft.ifftn(x_freq_mixed, dim=(-3, -2, -1)).real
 
     # Cast back to the original dtype (typically bfloat16) to match the rest of the pipeline
-    torch.permute(x_mixed, (0, 2, 1, 3, 4)) # [B,C,T,H,W] -> [B,T,C,H,W]
+    x_mixed = x_mixed.permute(0, 2, 1, 3, 4) # [B,C,T,H,W] -> [B,T,C,H,W]
     return x_mixed.to(dtype=orig_dtype)
 
 

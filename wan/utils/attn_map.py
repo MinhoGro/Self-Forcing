@@ -6,6 +6,9 @@ class Counter:
         self.cur_frame = 0
         self.time_step = 1000
         self.block = 0
+        self.rep_step = 0
+        self.max = 0
+        self.min = 0
 
 
 import os
