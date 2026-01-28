@@ -94,6 +94,108 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def _maybe_capture_attn(
+            self,
+            roped_query,
+            roped_key,
+            grid_sizes,
+            attn_capture,
+            layer_idx,
+    ):
+        if attn_capture is None:
+            return
+        if not attn_capture.get("enabled", True):
+            return
+        if attn_capture.get("only_once", True) and attn_capture.get("captured", False):
+            return
+        target_layer = attn_capture.get("layer_idx")
+        if target_layer is not None:
+            if isinstance(target_layer, (list, tuple, set)):
+                if layer_idx not in target_layer:
+                    return
+            else:
+                if layer_idx != target_layer:
+                    return
+        if attn_capture.get("rank0_only", True) and dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        with torch.no_grad():
+            frame_h = int(grid_sizes[0][1].item())
+            frame_w = int(grid_sizes[0][2].item())
+            frame_seqlen = frame_h * frame_w
+            if frame_seqlen <= 0:
+                return
+            b, lq, heads, dim = roped_query.shape
+            lk = roped_key.shape[1]
+            if lq % frame_seqlen != 0 or lk % frame_seqlen != 0:
+                return
+            fq = lq // frame_seqlen
+            fk = lk // frame_seqlen
+            if fq == 0 or fk == 0:
+                return
+
+            q = roped_query[:, :fq * frame_seqlen].reshape(b, fq, frame_seqlen, heads, dim).mean(2)
+            k = roped_key[:, :fk * frame_seqlen].reshape(b, fk, frame_seqlen, heads, dim).mean(2)
+
+            frame_idx = attn_capture.get("frame_idx", None)
+            if frame_idx is not None:
+                frame_idx = int(frame_idx)
+                frame_idx = max(0, min(frame_idx, fq - 1))
+                q_idx = torch.tensor([frame_idx], device=q.device, dtype=torch.long)
+                q_sel = q[:, frame_idx:frame_idx + 1]
+            else:
+                q_idx = torch.arange(fq, device=q.device, dtype=torch.long)
+                q_sel = q
+
+            logits = torch.einsum("bfhd,bghd->bhfg", q_sel, k) / math.sqrt(dim)
+            logits = logits.float()
+
+            if attn_capture.get("apply_block_mask", True):
+                num_frame_per_block = attn_capture.get("num_frame_per_block", None)
+                local_attn_size = attn_capture.get("local_attn_size", self.local_attn_size)
+                if num_frame_per_block is not None:
+                    query_start_frame = int(attn_capture.get("query_start_frame", 0))
+                    key_start_frame = int(attn_capture.get("key_start_frame", 0))
+                    q_global = q_idx + query_start_frame
+                    block_end = ((q_global // num_frame_per_block) + 1) * num_frame_per_block
+                    if local_attn_size is None or local_attn_size == -1:
+                        start = torch.zeros_like(block_end)
+                    else:
+                        start = torch.clamp(block_end - local_attn_size, min=0)
+                    k_idx = torch.arange(fk, device=logits.device, dtype=torch.long)
+                    k_global = k_idx + key_start_frame
+                    allowed = (k_global[None, :] < block_end[:, None]) & (k_global[None, :] >= start[:, None])
+                    mask = ~allowed
+                    logits = logits.masked_fill(
+                        mask.view(1, 1, mask.size(0), mask.size(1)),
+                        torch.finfo(logits.dtype).min
+                    )
+
+            attn = torch.softmax(logits, dim=-1)
+            head_idx = attn_capture.get("head_idx", None)
+            if head_idx is not None:
+                head_idx = int(head_idx)
+                if 0 <= head_idx < heads:
+                    attn = attn[:, head_idx]
+                else:
+                    attn = attn.mean(dim=1)
+            elif attn_capture.get("reduce_heads", True):
+                attn = attn.mean(dim=1)
+
+            result = {
+                "attn": attn.detach().cpu(),
+                "frame_idx": frame_idx,
+                "num_frames_q": fq,
+                "num_frames_k": fk,
+                "layer_idx": layer_idx,
+                "head_idx": head_idx,
+                "timestep": attn_capture.get("timestep"),
+                "current_start_frame": attn_capture.get("current_start_frame"),
+                "cache_start_frame": attn_capture.get("cache_start_frame"),
+            }
+            attn_capture["result"] = result
+            attn_capture["captured"] = True
+
     def forward(
             self,
             x,
@@ -104,7 +206,9 @@ class CausalWanSelfAttention(nn.Module):
             kv_cache=None,
             current_start=0,
             cache_start=None,
-            timestep=None
+            timestep=None,
+            attn_capture=None,
+            layer_idx=None
     ):
         # kv_cache = None # @hidir: ODE Regression enters here
         r"""
@@ -146,6 +250,14 @@ class CausalWanSelfAttention(nn.Module):
                 roped_query = torch.cat(roped_query, dim=1)
                 roped_key = torch.cat(roped_key, dim=1)
 
+                self._maybe_capture_attn(
+                    roped_query,
+                    roped_key,
+                    grid_sizes,
+                    attn_capture,
+                    layer_idx,
+                )
+
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
                     [roped_query,
@@ -176,6 +288,14 @@ class CausalWanSelfAttention(nn.Module):
             else:  # @hidir: ODE Regression enters here
                 roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)  # 1 x 32760 x 12 x 128
                 roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)  # 1 x 32760 x 12 x 128
+
+                self._maybe_capture_attn(
+                    roped_query,
+                    roped_key,
+                    grid_sizes,
+                    attn_capture,
+                    layer_idx,
+                )
 
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
@@ -215,7 +335,6 @@ class CausalWanSelfAttention(nn.Module):
             kv_cache_size = max_attention_frames * frame_seqlen  # 32760
             # after 21 frames, we evict, and rotate the cached key from scratch.
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    # if (current_end > kv_cache["global_end_index"].item()) and (
                     (num_new_tokens + kv_cache["local_end_index"].item()) > kv_cache_size):
                 # print('--------------------------------')
                 # print('[EVICTING...]')
@@ -267,6 +386,19 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][:, :frame_seqlen] = roped_key[:, :frame_seqlen]
                 else:
                     roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
+
+            if attn_capture is not None and frame_seqlen > 0:
+                attn_capture.setdefault("query_start_frame", int(current_start_frame))
+                key_start_index = max(0, local_end_index - self.max_attention_size)
+                attn_capture.setdefault("key_start_frame", int(key_start_index // frame_seqlen))
+
+            self._maybe_capture_attn(
+                roped_query,
+                roped_key,
+                grid_sizes,
+                attn_capture,
+                layer_idx,
+            )
 
             x = attention(
                 roped_query,
@@ -342,6 +474,8 @@ class CausalWanAttentionBlock(nn.Module):
             crossattn_cache=None,
             current_start=0,
             cache_start=None,
+            attn_capture=None,
+            layer_idx=None,
     ):
         r"""
         Args:
@@ -361,7 +495,8 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs, block_mask, kv_cache, current_start, cache_start,
+            attn_capture=attn_capture, layer_idx=layer_idx)
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -768,7 +903,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             kv_cache: dict = None,
             crossattn_cache: dict = None,
             current_start: int = 0,
-            cache_start: int = 0
+            cache_start: int = 0,
+            attn_capture: dict | None = None
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -805,11 +941,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
+        if cache_start is None:
+            cache_start = current_start
+
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
+
+        if attn_capture is not None:
+            attn_capture.setdefault("timestep", float(t.flatten()[0].item()))
+            attn_capture.setdefault("num_frame_per_block", self.num_frame_per_block)
+            attn_capture.setdefault("local_attn_size", self.local_attn_size)
+            frame_seqlen = int(grid_sizes[0][1].item() * grid_sizes[0][2].item())
+            if frame_seqlen > 0:
+                attn_capture.setdefault("current_start_frame", int(current_start // frame_seqlen))
+                attn_capture.setdefault("cache_start_frame", int(cache_start // frame_seqlen))
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
         x = torch.cat(x)
@@ -866,6 +1014,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "freqs": self.freqs,
+                        "attn_capture": attn_capture,
+                        "layer_idx": block_index,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -881,6 +1031,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "freqs": self.freqs,
+                        "attn_capture": attn_capture,
+                        "layer_idx": block_index,
                     }
                 )
                 x = block(x, **kwargs)
@@ -901,6 +1053,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             aug_t=None,
             clip_fea=None,
             y=None,
+            attn_capture: dict | None = None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -966,6 +1119,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
+
+        if attn_capture is not None:
+            attn_capture.setdefault("timestep", float(t.flatten()[0].item()))
+            attn_capture.setdefault("num_frame_per_block", self.num_frame_per_block)
+            attn_capture.setdefault("local_attn_size", self.local_attn_size)
 
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
@@ -1037,12 +1195,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 }
             )
             if torch.is_grad_enabled() and self.gradient_checkpointing:  # @hidir: ODE Regression enters here
+                kwargs.update(
+                    {
+                        "attn_capture": attn_capture,
+                        "layer_idx": block_index,
+                    }
+                )
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x, **kwargs,
                     use_reentrant=False,
                 )
             else:
+                kwargs.update(
+                    {
+                        "attn_capture": attn_capture,
+                        "layer_idx": block_index,
+                    }
+                )
                 x = block(x, **kwargs)
 
         if clean_x is not None:

@@ -193,15 +193,51 @@ class CausalInferencePipeline(torch.nn.Module):
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
 
+                # 在每个时间块的“第一个 diffusion step”抓一次，覆盖所有 frame
+                capture_this_step = (index == 0)
+                attn_capture = None
+                if capture_this_step:
+                    attn_capture = {
+                        "enabled": True,
+                        "only_once": True,         # 抓一次就停
+                        "layer_idx": 0,            # 选第几层（0~29）
+                        "frame_idx": None,         # None = 保留所有 query 帧，得到 Fq×Fk
+                        "reduce_heads": True,      # True = 多头平均
+                        "apply_block_mask": True,  # 帧级近似的 block-wise causal mask
+                    }
+                    attn_capture["timestep"] = int(current_timestep)
+                    attn_capture["current_start_frame"] = current_start_frame
+
+                _, denoised_pred = self.generator(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                    attn_capture=attn_capture,
+                )
+
+                # 读取结果（在同一次调用后即可拿到）
+                if attn_capture and "result" in attn_capture:
+                    result = attn_capture["result"]
+                    # result["attn"] 形状:
+                    # - reduce_heads=True & frame_idx=None -> [B, Fq, Fk]
+                    # - reduce_heads=False -> [B, H, Fq, Fk]
+                    import matplotlib.pyplot as plt
+
+                    attn = result["attn"].squeeze(0)  # -> [Fq, Fk] 或 [H, Fq, Fk]
+                    if attn.ndim == 3:  # 选一个 head
+                        attn = attn[0]
+                    plt.imshow(attn, aspect="auto", cmap="viridis")
+                    plt.xlabel("Key frame")
+                    plt.ylabel("Query frame")
+                    plt.title(f"t={result['timestep']} layer={result['layer_idx']}")
+                    plt.show()
+                    plt.savefig(f"frame{current_start_frame}_attn_{result['timestep']}_{result['layer_idx']}.png")
+                    plt.close()
+
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -210,15 +246,8 @@ class CausalInferencePipeline(torch.nn.Module):
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    # for getting real output
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
+                    # last step -> stop
+                    pass
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred

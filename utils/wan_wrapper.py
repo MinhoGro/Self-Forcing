@@ -129,6 +129,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
+        self.is_causal = is_causal
 
         # For non-causal diffusion, all frames share the same timestep
         self.uniform_timestep = not is_causal
@@ -225,7 +226,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
-        cache_start: Optional[int] = None
+        cache_start: Optional[int] = None,
+        attn_capture: Optional[dict] = None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -236,6 +238,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             input_timestep = timestep
 
         logits = None
+        extra_kwargs = {}
+        if self.is_causal:
+            extra_kwargs["attn_capture"] = attn_capture
         # X0 prediction
         if kv_cache is not None:
             flow_pred = self.model(
@@ -245,7 +250,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                **extra_kwargs
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -256,6 +262,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
+                    **extra_kwargs
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
@@ -267,14 +274,16 @@ class WanDiffusionWrapper(torch.nn.Module):
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
-                        concat_time_embeddings=concat_time_embeddings
+                        concat_time_embeddings=concat_time_embeddings,
+                        **extra_kwargs
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=self.seq_len,
+                        **extra_kwargs
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
