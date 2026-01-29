@@ -4,7 +4,20 @@ import torch
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
+from wan.modules.causal_model import CausalWanSelfAttention, CausalWanModel
 
+import os
+import matplotlib.pyplot as plt
+
+class Counter:
+    def __init__(self, output_frames) -> None:
+        self.output_frames = output_frames
+        self.attn_block_idx = 0
+        self.video_block_idx = 0
+        self.time_step = 1000
+        self.empty_heatmap = torch.zeros(30, output_frames, output_frames)
+        self.heatmap = {}
+        self.isInference = True
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -43,6 +56,25 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+        self.counter = None
+
+    def _save_heatmaps(self, counter, out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        for t, heat in counter.heatmap.items():
+            heat = heat.detach().float().cpu()  # [30, F, F]
+            for b in range(heat.shape[0]):
+                h = heat[b]
+                # 归一化（可选）
+                h = h / (h.max() + 1e-8)
+
+                plt.imshow(h, cmap="magma", vmin=0, vmax=1, origin="lower")
+                plt.xlabel("query frame")
+                plt.ylabel("key frame")
+                plt.title(f"timestep={int(t)} block={b}")
+                plt.colorbar(fraction=0.046, pad=0.04)
+                plt.savefig(os.path.join(out_dir, f"t{int(t)}_b{b}.png"), dpi=1000)
+                plt.close()
 
     def inference(
         self,
@@ -94,6 +126,12 @@ class CausalInferencePipeline(torch.nn.Module):
             device=noise.device,
             dtype=noise.dtype
         )
+        if self.counter is None:
+            self.counter = Counter(num_output_frames)
+            if isinstance(self.generator.model, CausalWanModel):
+                self.generator.model.apply(
+                    lambda m: setattr(m, "counter", self.counter) if isinstance(m, CausalWanSelfAttention) else None
+                )
 
         # Set up profiling if requested
         if profile:
@@ -186,7 +224,14 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
-                print(f"current_timestep: {current_timestep}")
+                print(f"current video frames: {self.counter.video_block_idx * self.num_frame_per_block}，timestep: {current_timestep}")
+                self.counter.isInference = True
+                self.counter.time_step = int(current_timestep)
+                if not int(current_timestep) in self.counter.heatmap:
+                    self.counter.heatmap[int(current_timestep)] = self.counter.empty_heatmap.clone()
+                    print(f"initiate heatmap for timestep {int(current_timestep)}")
+                self.counter.attn_block_idx = 0
+
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -225,6 +270,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
+            self.counter.isInference = False
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=conditional_dict,
@@ -242,6 +288,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
+            self.counter.video_block_idx += 1
 
         if profile:
             # End diffusion timing and synchronize CUDA
@@ -269,6 +316,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
             print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
             print(f"  - Total time: {total_time:.2f} ms")
+
+        # draw heatmap
+        self._save_heatmaps(self.counter, "./heat_maps/")
 
         if return_latents:
             return video, output
