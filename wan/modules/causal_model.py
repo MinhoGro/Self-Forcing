@@ -17,6 +17,8 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+from torch.nn import MultiheadAttention
+import torch.nn.functional as F
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -95,6 +97,28 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.evic_keylen = 0
+        # headmask list [block,head]
+        self.head_mask_dict = {
+            1: [6, 9],
+            2: [4, 5, 9],
+            3: [2, 3, 9],
+            4: [10],
+            5: [9],
+            7: [8, 9],
+            8: [6, 8],
+            10: [6, 8],
+            11: [8],
+            12: [11],
+            15: [8],
+            16: [8],
+            17: [2],
+            19: [1, 5, 7],
+            20: [4, 6],
+            21: [2],
+            25: [8],
+            26: [0, 1, 6],
+            29: [11]
+        }
 
     def forward(
         self,
@@ -267,23 +291,26 @@ class CausalWanSelfAttention(nn.Module):
                 else:
                     roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
                     
-            x = attention(
-                roped_query,
-                roped_key,
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
+            # x = attention(
+            #     roped_query,
+            #     roped_key,
+            #     kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            # )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
+            # output
+            x = x.flatten(2)
+            x = self.o(x)
+
             if not self.counter.isInference:
-                x = x.flatten(2)
-                x = self.o(x)
                 return x
 
             # Q size： [B, S, head_num, head_dim] 
             # q, k, v: [B, L, N, D]
             q = roped_query.transpose(1, 2)  # [B, N, Lq, D]
             k = roped_key.transpose(1, 2)  # [B, N, Lk, D]
+            v = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index].transpose(1, 2)
 
             B, N, Lq, D = q.shape
             Lk = k.shape[2]
@@ -309,7 +336,8 @@ class CausalWanSelfAttention(nn.Module):
                 exp_scores = torch.exp(scores - m_new)
                 l = l * torch.exp(m - m_new) + exp_scores.sum(dim=-1, keepdim=True)
                 m = m_new
-            
+
+            x_accum = torch.zeros_like(roped_query).transpose(1, 2)
             # cal real exp_scores
             for s in range(0, Lk, chunk):
                 e = min(s + chunk, Lk)
@@ -318,10 +346,22 @@ class CausalWanSelfAttention(nn.Module):
                 scores = torch.einsum("bnqd,bnkd->bnqk", q, k_chunk) * scale
                 scores = scores.float()
 
+                # score mask before softmax
+                if self.counter.attn_block_idx in self.head_mask_dict and s == 0:
+                    mask_list = self.head_mask_dict[self.counter.attn_block_idx]
+                    scores[:,mask_list, q.shape[2]-frame_seqlen:q.shape[2],:] = -1e9  # only mask last query token
                 exp_scores = torch.exp(scores - m) / l
-                score = exp_scores.sum(dim=-3)    # n dim
-                score = score.sum(dim=-1)    # lk dim
-                score = score.view(B, num_new_frames, frame_seqlen).mean(dim=-1)
+
+                # calculate masked attention
+                value = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                v_chunk = value[:, s:e].transpose(1,2)  # [B, N, Lv, D]
+                exp_scores = exp_scores.to(v_chunk.dtype)
+                # x_accum += torch.einsum("bnqk,bnkd->bnqd", exp_scores, v_chunk)
+                # score size [B, N, Lq, Lk]
+                if self.counter.head_only is not True:
+                    exp_scores = exp_scores.mean(dim=1)    # n head dim
+                score = exp_scores.sum(dim=-1)    # lk dim
+                score = score.unflatten(-1, (num_new_frames, frame_seqlen)).mean(dim=-1)
 
                 if s < sink_tokens:
                     key_frame_idx = s // chunk
@@ -337,17 +377,38 @@ class CausalWanSelfAttention(nn.Module):
 
                 score = score.to(cpu)
                 # print(f"time step:{self.counter.time_step}, attn_block:{self.counter.attn_block_idx}")
-                self.counter.heatmap[self.counter.time_step][self.counter.attn_block_idx, 
-                                        key_frame_idx, 
-                                        query_frame_st:query_frame_ed
-                                    ] = score[0]
+                if self.counter.head_only is not True:
+                    self.counter.heatmap[self.counter.time_step][self.counter.attn_block_idx,
+                    0,
+                    key_frame_idx,
+                    query_frame_st:query_frame_ed
+                    ] = score[0]
+                else:
+                    for i, h in enumerate(score[0]):
+                        self.counter.heatmap[self.counter.time_step][self.counter.attn_block_idx,
+                        i,
+                        key_frame_idx,
+                        query_frame_st:query_frame_ed
+                        ] = h
 
+            # calcuate mask attenion here
+            attn_mask = None
+            if self.counter.attn_block_idx in self.head_mask_dict and s == 0:
+                attn_mask = torch.ones(1, q.shape[1], 1, k.shape[-2], device=q.device, dtype=torch.bool)
+                mask_list = self.head_mask_dict[self.counter.attn_block_idx]
+                attn_mask[:, mask_list, :, 0] = False
+            x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    is_causal=False
+                )
+            x = x.transpose(1, 2)
         if hasattr(self, "counter"):
             self.counter.attn_block_idx += 1
 
-        # output
         x = x.flatten(2)
         x = self.o(x)
+
         return x
 
 class CausalWanAttentionBlock(nn.Module):

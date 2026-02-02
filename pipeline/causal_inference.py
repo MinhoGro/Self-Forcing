@@ -8,6 +8,8 @@ from wan.modules.causal_model import CausalWanSelfAttention, CausalWanModel
 
 import os
 import matplotlib.pyplot as plt
+import numpy as np
+import copy
 
 class Counter:
     def __init__(self, output_frames) -> None:
@@ -15,9 +17,10 @@ class Counter:
         self.attn_block_idx = 0
         self.video_block_idx = 0
         self.time_step = 1000
-        self.empty_heatmap = torch.zeros(30, output_frames, output_frames)
+        self.empty_heatmap = torch.zeros(30, 12, output_frames, output_frames)
         self.heatmap = {}
-        self.isInference = True
+        self.isInference = False
+        self.head_only = True
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -58,23 +61,32 @@ class CausalInferencePipeline(torch.nn.Module):
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
         self.counter = None
+        self.noisy_reverse = None
 
     def _save_heatmaps(self, counter, out_dir):
         os.makedirs(out_dir, exist_ok=True)
         for t, heat in counter.heatmap.items():
             heat = heat.detach().float().cpu()  # [30, F, F]
-            for b in range(heat.shape[0]):
-                h = heat[b]
-                # 归一化（可选）
-                h = h / (h.max() + 1e-8)
+            for head in range(heat.shape[0]):
+                if heat[head,0,0,0] == 0:
+                    continue
+                for b in range(heat.shape[1]):
+                    h = heat[head][b]
+                    # 归一化（可选）
+                    h = h / (h.max() + 1e-8)
 
-                plt.imshow(h, cmap="magma", vmin=0, vmax=1, origin="lower")
-                plt.xlabel("query frame")
-                plt.ylabel("key frame")
-                plt.title(f"timestep={int(t)} block={b}")
-                plt.colorbar(fraction=0.046, pad=0.04)
-                plt.savefig(os.path.join(out_dir, f"t{int(t)}_b{b}.png"), dpi=1000)
-                plt.close()
+                    h_masked = h
+                    h_masked[h == 0] = np.nan
+                    cmap = copy.copy(plt.get_cmap("magma"))
+                    cmap.set_bad(color='white')
+
+                    plt.imshow(h_masked, cmap="magma", vmin=0, vmax=1, origin="lower")
+                    plt.xlabel("query frame")
+                    plt.ylabel("key frame")
+                    plt.title(f"timestep={int(t)} block={b}")
+                    plt.colorbar(fraction=0.046, pad=0.04)
+                    plt.savefig(os.path.join(out_dir, f"t{int(t)}_h{head}_b{b}.png"), dpi=1000)
+                    plt.close()
 
     def inference(
         self,
@@ -222,10 +234,20 @@ class CausalInferencePipeline(torch.nn.Module):
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
+            if self.noisy_reverse == None:
+                self.noisy_reverse = self.scheduler.add_noise(
+                    output[:, 0:3].flatten(0, 1),
+                    torch.randn_like(noisy_input.flatten(0, 1)),
+                    self.denoising_step_list[0] * torch.ones(
+                        [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                ).unflatten(0, noisy_input.shape[:2])
+            noisy_input[:, -1] = self.noisy_reverse[:, 0]
+            noisy_input[:, -1] = self.noisy_reverse[:, 1]
+
             # Step 3.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
                 print(f"current video frames: {self.counter.video_block_idx * self.num_frame_per_block}，timestep: {current_timestep}")
-                self.counter.isInference = True
+                self.counter.isInference = False
                 self.counter.time_step = int(current_timestep)
                 if not int(current_timestep) in self.counter.heatmap:
                     self.counter.heatmap[int(current_timestep)] = self.counter.empty_heatmap.clone()
