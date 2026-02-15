@@ -24,7 +24,27 @@ flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+def rope_cut(freqs, start_frame, f, transition_frames=3, transition_from=45):
+    """
+    Apply rope cut for scene transitions.
+
+    Args:
+        freqs: Frequency tensor, shape [1024, C / num_heads / 2]
+        start_frame: Starting frame index (integer)
+        f: Number of frames (integer)
+        transition_frames: Latent block size (integer, default=3)
+        transition_from: Starting frame index for transition (integer, default=45)
+
+    Returns:
+        temporal_freqs: Concatenated temporal frequencies
+    """
+    starting_group = freqs[0][start_frame:start_frame + f - transition_frames]
+    final_group = freqs[0][transition_from:transition_from + transition_frames]
+    temporal_freqs = torch.cat([starting_group, final_group], dim=0)
+    return temporal_freqs
+
+
+def block_relativistic_rope(x, grid_sizes, freqs, start_frame=0, scene_cut=False):
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -38,13 +58,19 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 
         # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
+            seq_len, n, -1, 2))  # @hidir: becomes 4680 x 12 x 32
+
+        if scene_cut:
+            temporal_freqs = rope_cut(freqs, start_frame, f)
+        else:
+            temporal_freqs = freqs[0][start_frame:start_frame + f]
+
         freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            temporal_freqs.view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
-            dim=-1).reshape(seq_len, 1, -1)
+            dim=-1).reshape(seq_len, 1, -1)  # @hidir: becomes 4680 x 1 x 64
 
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
@@ -52,7 +78,9 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).type_as(x)
+
+    result = torch.stack(output).type_as(x)
+    return result
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -84,16 +112,18 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(
-        self,
-        x,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        block_mask,
-        kv_cache=None,
-        current_start=0,
-        cache_start=None
+            self,
+            x,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            block_mask,
+            kv_cache=None,
+            current_start=0,
+            cache_start=None,
+            timestep=None
     ):
+        # kv_cache = None # @hidir: ODE Regression enters here
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -160,9 +190,9 @@ class CausalWanSelfAttention(nn.Module):
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
 
-            else:
-                roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-                roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+            else:  # @hidir: ODE Regression enters here
+                roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)  # 1 x 32760 x 12 x 128
+                roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)  # 1 x 32760 x 12 x 128
 
                 padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
                 padded_roped_query = torch.cat(
@@ -188,49 +218,82 @@ class CausalWanSelfAttention(nn.Module):
                     query=padded_roped_query.transpose(2, 1),
                     key=padded_roped_key.transpose(2, 1),
                     value=padded_v.transpose(2, 1),
-                    block_mask=block_mask
+                    block_mask=block_mask  # @hidir: We turned it off block mask for the stage 1
                 )[:, :, :-padded_length].transpose(2, 1)
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
-            current_start_frame = current_start // frame_seqlen
-            roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-
-            current_end = current_start + roped_query.shape[1]
+            num_new_tokens = q.shape[1]
+            num_new_frames = num_new_tokens // frame_seqlen
+            current_end = current_start + num_new_tokens
+            current_start_frame = (current_start // frame_seqlen)
             sink_tokens = self.sink_size * frame_seqlen
+            max_attention_frames = self.max_attention_size // frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
-            kv_cache_size = kv_cache["k"].shape[1]
-            num_new_tokens = roped_query.shape[1]
+            kv_cache_size = max_attention_frames * frame_seqlen  # 32760
+            # after 21 frames, we evict, and rotate the cached key from scratch.
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+                    (num_new_tokens + kv_cache["local_end_index"].item()) > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
                 # Clone the source slice to avoid overlapping memory error
                 num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                 num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
                 kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    kv_cache["k"][:,
+                    sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    kv_cache["v"][:,
+                    sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 # Insert the new keys/values at the end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
+                                  kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache["k"][:, local_start_index:local_end_index] = k
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            else:
+                k_for_rope = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                # ------------------------------------------------------------ #
+                grid_sizes_full = grid_sizes.clone()
+                grid_sizes_full[0][0] = max_attention_frames
+                # ------------------------------------------------------------ #
+                scene_cut = kv_cache.get("scene_cut", False)
+                relative_start_frame = max_attention_frames - num_new_frames
+                roped_query = block_relativistic_rope(
+                    q, grid_sizes, freqs, start_frame=relative_start_frame, scene_cut=scene_cut).type_as(v)
+                # ------------------------------------------------------------ #
+                roped_key = block_relativistic_rope(
+                    k_for_rope, grid_sizes_full, freqs, start_frame=0, scene_cut=scene_cut).type_as(v)
+                roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
+                # ------------------------------------------------------------ #
+            else:  # first 21 frame happens here
                 # Assign new keys/values directly up to current_end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache["k"][:, local_start_index:local_end_index] = k
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+                k_for_rope = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                # ------------------------------------------------------------ #
+                grid_sizes_full = grid_sizes.clone()
+                grid_sizes_full[0][0] = min(local_end_index // frame_seqlen, max_attention_frames)
+                # ------------------------------------------------------------ #
+                scene_cut = kv_cache.get("scene_cut", False)
+                relative_start_frame = current_start_frame if current_start_frame < max_attention_frames else max_attention_frames - num_new_frames
+                roped_query = block_relativistic_rope(
+                    q, grid_sizes, freqs, start_frame=relative_start_frame, scene_cut=scene_cut).type_as(v)
+                # ------------------------------------------------------------ #
+                roped_key = block_relativistic_rope(
+                    k_for_rope, grid_sizes_full, freqs, start_frame=0, scene_cut=scene_cut).type_as(v)
+                # ------------------------------------------------------------ #
+                if local_start_index == 0:
+                    kv_cache["k"][:, :frame_seqlen] = roped_key[:, :frame_seqlen]
+                else:
+                    roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
+
             x = attention(
                 roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                roped_key,
                 kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             )
+
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
@@ -263,7 +326,12 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(dim,
+                                                num_heads,
+                                                local_attn_size,
+                                                sink_size,
+                                                qk_norm,
+                                                eps)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -278,22 +346,22 @@ class CausalWanAttentionBlock(nn.Module):
             nn.Linear(ffn_dim, dim))
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
 
     def forward(
-        self,
-        x,
-        e,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        context,
-        context_lens,
-        block_mask,
-        kv_cache=None,
-        crossattn_cache=None,
-        current_start=0,
-        cache_start=None
+            self,
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+            block_mask,
+            kv_cache=None,
+            crossattn_cache=None,
+            current_start=0,
+            cache_start=None,
     ):
         r"""
         Args:
@@ -324,11 +392,11 @@ class CausalWanAttentionBlock(nn.Module):
                                     context_lens, crossattn_cache=crossattn_cache)
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
-                 frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
+                                                       frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
             )
             # with amp.autocast(dtype=torch.float32):
             x = x + (y.unflatten(dim=1, sizes=(num_frames,
-                     frame_seqlen)) * e[5]).flatten(1, 2)
+                                               frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
@@ -350,7 +418,7 @@ class CausalHead(nn.Module):
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim ** 0.5)
 
     def forward(self, x, e):
         r"""
@@ -434,7 +502,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         """
 
         super().__init__()
-
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
 
@@ -465,7 +532,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
 
-        # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
@@ -478,7 +544,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
+        d = (dim // num_heads)
         self.freqs = torch.cat([
             rope_params(1024, d - 4 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
@@ -504,8 +570,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
-        device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1
+            device: torch.device | str, num_frames: int = 21,
+            frame_seqlen: int = 1560, num_frame_per_block=1, local_attn_size=-1
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -530,13 +596,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         for tmp in frame_indices:
             ends[tmp:tmp + frame_seqlen * num_frame_per_block] = tmp + \
-                frame_seqlen * num_frame_per_block
+                                                                 frame_seqlen * num_frame_per_block
 
         def attention_mask(b, h, q_idx, kv_idx):
             if local_attn_size == -1:
                 return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
             else:
-                return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (q_idx == kv_idx)
+                return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (
+                            q_idx == kv_idx)
             # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
@@ -562,8 +629,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     @staticmethod
     def _prepare_teacher_forcing_mask(
-        device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1
+            device: torch.device | str, num_frames: int = 21,
+            frame_seqlen: int = 1560, num_frame_per_block=1
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -641,7 +708,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             from torch.nn.attention.flex_attention import create_mask
 
             mask = create_mask(attention_mask, B=None, H=None, Q_LEN=total_length +
-                               padded_length, KV_LEN=total_length + padded_length, device=device)
+                                                                     padded_length, KV_LEN=total_length + padded_length,
+                               device=device)
             import cv2
             mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
             imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
@@ -650,8 +718,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask_i2v(
-        device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=4, local_attn_size=-1
+            device: torch.device | str, num_frames: int = 21,
+            frame_seqlen: int = 1560, num_frame_per_block=4, local_attn_size=-1
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -680,7 +748,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         for idx, tmp in enumerate(frame_indices):
             ends[tmp:tmp + frame_seqlen * num_frame_per_block] = tmp + \
-                frame_seqlen * num_frame_per_block
+                                                                 frame_seqlen * num_frame_per_block
 
         def attention_mask(b, h, q_idx, kv_idx):
             if local_attn_size == -1:
@@ -710,17 +778,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         return block_mask
 
     def _forward_inference(
-        self,
-        x,
-        t,
-        context,
-        seq_len,
-        clip_fea=None,
-        y=None,
-        kv_cache: dict = None,
-        crossattn_cache: dict = None,
-        current_start: int = 0,
-        cache_start: int = 0
+            self,
+            x,
+            t,
+            context,
+            seq_len,
+            clip_fea=None,
+            y=None,
+            kv_cache: dict = None,
+            crossattn_cache: dict = None,
+            current_start: int = 0,
+            cache_start: int = 0
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -801,12 +869,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask
+            block_mask=self.block_mask,
         )
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
                 return module(*inputs, **kwargs)
+
             return custom_forward
 
         for block_index, block in enumerate(self.blocks):
@@ -815,7 +884,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "freqs": self.freqs,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -829,7 +899,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "freqs": self.freqs,
                     }
                 )
                 x = block(x, **kwargs)
@@ -840,16 +911,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x)
 
-    def _forward_train(
-        self,
-        x,
-        t,
-        context,
-        seq_len,
-        clean_x=None,
-        aug_t=None,
-        clip_fea=None,
-        y=None,
+    def _forward_train(  # @hidir: ODE Regression enters here
+            self,
+            x,
+            t,
+            context,
+            seq_len,
+            clean_x=None,
+            aug_t=None,
+            clip_fea=None,
+            y=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -898,7 +969,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
-                else:
+                else:  # @hidir: ODE Regression enters here
                     self.block_mask = self._prepare_blockwise_causal_attn_mask(
                         device, num_frames=x.shape[2],
                         frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
@@ -976,10 +1047,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
                 return module(*inputs, **kwargs)
+
             return custom_forward
 
-        for block in self.blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+        for block_index, block in enumerate(self.blocks):
+            kwargs.update(
+                {
+                    "freqs": self.freqs,
+                }
+            )
+            if torch.is_grad_enabled() and self.gradient_checkpointing:  # @hidir: ODE Regression enters here
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x, **kwargs,
@@ -999,9 +1076,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         return torch.stack(x)
 
     def forward(
-        self,
-        *args,
-        **kwargs
+            self,
+            *args,
+            **kwargs
     ):
         if kwargs.get('kv_cache', None) is not None:
             return self._forward_inference(*args, **kwargs)
