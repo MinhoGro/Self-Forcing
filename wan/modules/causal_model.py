@@ -19,6 +19,7 @@ import math
 import torch.distributed as dist
 from torch.nn import MultiheadAttention
 import torch.nn.functional as F
+import torch.fft as fft
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -239,7 +240,8 @@ class CausalWanSelfAttention(nn.Module):
             max_attention_frames = self.max_attention_size // frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = max_attention_frames * frame_seqlen #32760
-            # after 21 frames, we evict, and rotate the cached key from scratch. 
+            # after 21 frames, we evict, and rotate the cached key from scratch.
+            k_for_rope = None
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     (num_new_tokens + kv_cache["local_end_index"].item()) > kv_cache_size):
                 # print('--------------------------------')
@@ -290,12 +292,225 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][:, :frame_seqlen] = roped_key[:, :frame_seqlen]
                 else:
                     roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
-                    
-            # x = attention(
-            #     roped_query,
-            #     roped_key,
-            #     kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            # )
+
+            attn_mask = None
+            # if self.counter.attn_block_idx in self.head_mask_dict:
+            #     print(f"processing attn mask")
+            #     # (Batch, Heads, Q_Len, K_Len)
+            #     attn_mask = torch.ones(1, roped_query.shape[2], roped_query.shape[1], roped_key.shape[1], device=q.device, dtype=torch.bool)
+            #     mask_list = self.head_mask_dict[self.counter.attn_block_idx]
+            #     attn_mask[:, mask_list, -1560:, 0:1560] = False
+
+            if hasattr(self, "counter"):
+                self.counter.attn_block_idx += 1
+
+            value = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+
+# """
+#             # ==============================================================================
+#             # Robust Spatial-Aligned Anchor Mechanism
+#             # ==============================================================================
+#
+#             # --- 1. 准备数据 ---
+#             B, N, H, D = k_for_rope.shape
+#             tokens_per_frame = 1560
+#
+#             # [Source] 内容源：第一帧 (从未旋转的 Key 中提取) -> 提供纹理细节
+#             k_source = k_for_rope[:, 0:tokens_per_frame]  # [B, 1560, H, D]
+#             v_source = value[:, 0:tokens_per_frame]  # [B, 1560, H, D]
+#
+#             # [Target] 布局源：最近一帧 (从未旋转的 Key 中提取) -> 提供空间位置
+#             k_target = k_for_rope[:, 0:tokens_per_frame]  # [B, 1560, H, D]
+#
+#             # --- 2. 维度变换 (关键修复) ---
+#             # 必须转换为 [B, H, N, D] 才能计算 Token-to-Token 的空间相似度
+#             k_source_p = k_source.permute(0, 2, 1, 3)
+#             v_source_p = v_source.permute(0, 2, 1, 3)
+#             k_target_p = k_target.permute(0, 2, 1, 3)
+#
+#             # --- 3. 计算对齐矩阵 (Self-Alignment) ---
+#             scale_factor = D ** -0.5
+#
+#             # 计算 Target(当前位置) 和 Source(第一帧内容) 的相似度
+#             # Shape: (B, H, 1560, D) @ (B, H, D, 1560) -> (B, H, 1560, 1560)
+#             sim_matrix = torch.matmul(k_target_p, k_source_p.transpose(-1, -2)) * scale_factor
+#             align_weights = torch.softmax(sim_matrix, dim=-1)
+#
+#             # --- 4. 重组特征 (Warping) ---
+#             # 利用权重将 Source 的特征“搬运”到 Target 的位置
+#             # 结果 v_aligned_p 拥有第一帧的清晰度，但位置和当前帧一致
+#             v_aligned_p = torch.matmul(align_weights, v_source_p)  # [B, H, 1560, D]
+#             k_aligned_p = torch.matmul(align_weights, k_source_p)  # [B, H, 1560, D] (Key 也要对齐)
+#
+#             # --- 5. 还原维度 ---
+#             # 转回 [B, N, H, D] 以便后续拼接
+#             v_aligned = v_aligned_p.permute(0, 2, 1, 3)
+#             k_aligned = k_aligned_p.permute(0, 2, 1, 3)
+#
+#             # --- 6. RoPE 伪装 ---
+#             grid_sizes_append = grid_sizes.clone()
+#             # 确保修改所有 Batch 的时间维度为 1
+#             grid_sizes_append[:, 0] = 1
+#
+#             # 计算起始位置：紧贴当前 Cache 末尾
+#             append_start = k_for_rope.shape[1] // tokens_per_frame
+#
+#             # 对对齐后的 Key 进行 RoPE，位置设为 "Next Frame"
+#             k_append_roped = causal_rope_apply(
+#                 k_aligned,
+#                 grid_sizes_append,
+#                 freqs,
+#                 start_frame=append_start,
+#                 scene_cut=scene_cut
+#             ).type_as(v)
+#
+#             # --- 7. 拼接 (修复了维度报错) ---
+#             # 直接拼接，不要用 v_aligned[0] 这种写法，保持维度一致
+#             roped_key = torch.cat([roped_key, k_append_roped], dim=1)
+#             value = torch.cat([value, v_aligned], dim=1)
+#
+#             # --- 8. 扩展 Mask (必须做) ---
+#             if attn_mask is not None:
+#                 # 获取当前 mask 形状
+#                 # 假设 attn_mask 是 [B, L_q, L_k]
+#                 B_mask, L_q, L_k = attn_mask.shape[:3]
+#
+#                 # 构造全 0 (可见) 的扩展 mask
+#                 # 注意：请根据你模型具体的 mask 定义 (bool vs float) 调整
+#                 # 如果是 additive mask (0.0=可见, -inf=屏蔽), 用 zeros
+#                 mask_append = torch.zeros(
+#                     (B_mask, L_q, tokens_per_frame),
+#                     device=attn_mask.device,
+#                     dtype=attn_mask.dtype
+#                 )
+#
+#                 # 拼接
+#                 attn_mask_new = torch.cat([attn_mask, mask_append], dim=-1)
+#             else:
+#                 attn_mask_new = None
+#
+#             # --- 9. 计算 Attention ---
+#             x = attention(
+#                 roped_query,
+#                 roped_key,
+#                 value,
+#                 attn_mask=attn_mask,  # 使用扩展后的 mask
+#             )
+# """
+
+            # value mask
+            # if self.counter.attn_block_idx in self.head_mask_dict:
+            #     head_list = self.head_mask_dict[self.counter.attn_block_idx]
+            #     value_mod = value.clone()
+            #     value_mod[:,-1560:] = value[:,0:1560]
+            #     value_mod[:,-3120:-1560] = value[:,0:1560]
+            #     # value_mod[:, 0:1560] = value[:, -4680:-3120]
+            #     x_mod = attention(
+            #         roped_query,
+            #         roped_key,
+            #         value_mod,
+            #         attn_mask=attn_mask,
+            #     )
+            #     x[:, head_list] = x_mod[:, head_list]
+
+            # ==============================================================================
+            # Dual-Stream Anchor: Feature Refinement + Identity Injection
+            # ==============================================================================
+
+            # --- 1. 数据准备 ---
+            B, N, H, D = k_for_rope.shape
+            tokens_per_frame = 1560
+            scale_factor = D ** -0.5
+
+            # [Source A]: 第一帧 (Identity Source - 绝对真值)
+            k_first = k_for_rope[:, :tokens_per_frame]  # [B, 1560, H, D]
+            v_first = value[:, :tokens_per_frame]  # [B, 1560, H, D]
+
+            # [Source B / Target]: 上一帧 (Motion Source - 当前位置)
+            k_last = k_for_rope[:, -tokens_per_frame:]  # [B, 1560, H, D]
+            v_last = value[:, -tokens_per_frame:]  # [B, 1560, H, D]
+
+            # --- 2. 维度变换 (Batch, Head, Tokens, Dim) ---
+            k_first_p = k_first.permute(0, 2, 1, 3)
+            v_first_p = v_first.permute(0, 2, 1, 3)
+            k_last_p = k_last.permute(0, 2, 1, 3)
+            v_last_p = v_last.permute(0, 2, 1, 3)
+
+            # --------------------------------------------------------------------------
+            # Stream 1: Motion Refinement (你刚才发现的有效操作)
+            # Self-Attention on Last Frame -> 去噪、平滑、保持连续性
+            # --------------------------------------------------------------------------
+            # sim_motion: (B, H, 1560, 1560)
+            sim_motion = torch.matmul(k_last_p, k_last_p.transpose(-1, -2)) * scale_factor
+            attn_motion = torch.softmax(sim_motion, dim=-1)
+            # v_motion: 提纯后的上一帧
+            v_motion_p = torch.matmul(attn_motion, v_last_p)
+
+            # --------------------------------------------------------------------------
+            # Stream 2: Identity Injection (解决漂移的 Trick)
+            # Cross-Attention: 用 Last 的位置去查 First 的纹理
+            # --------------------------------------------------------------------------
+            # sim_identity: (B, H, 1560, 1560)
+            # 含义：当前帧的这个像素，对应第一帧的哪个像素？
+            sim_identity = torch.matmul(k_last_p, k_first_p.transpose(-1, -2)) * scale_factor
+            attn_identity = torch.softmax(sim_identity, dim=-1)
+            # v_identity: 搬运过来的第一帧 (拥有第一帧的纹理，但位置在上一帧)
+            v_identity_p = torch.matmul(attn_identity, v_first_p)
+
+            # --------------------------------------------------------------------------
+            # Fusion: 融合两个流
+            # --------------------------------------------------------------------------
+            # alpha 控制 "纠正力度"。
+            # 0.2-0.3 是经验值。太高会闪烁(因为对齐不完美)，太低拉不住漂移。
+            alpha = 0.2
+
+            v_anchor_p = (1 - alpha) * v_motion_p + alpha * v_identity_p
+
+            # Key 依然使用上一帧的 Key (因为我们要告诉模型：物体就在这儿)
+            # 对 Key 也做一个简单的 Refinement 是可选的，但直接用原始 k_last 最稳
+            k_anchor_p = k_last_p
+
+            # --- 3. 还原维度 ---
+            v_anchor = v_anchor_p.permute(0, 2, 1, 3)
+            k_anchor = k_anchor_p.permute(0, 2, 1, 3)
+
+            # --- 4. RoPE 伪装 ---
+            grid_sizes_append = grid_sizes.clone()
+            grid_sizes_append[:, 0] = 1
+            append_start = k_for_rope.shape[1] // tokens_per_frame
+
+            k_anchor_roped = causal_rope_apply(
+                k_anchor,
+                grid_sizes_append,
+                freqs,
+                start_frame=append_start,
+                scene_cut=scene_cut
+            ).type_as(v)
+
+            # --- 5. 拼接与 Mask ---
+            roped_key = torch.cat([roped_key, k_anchor_roped], dim=1)
+            value = torch.cat([value, v_anchor], dim=1)
+
+            # Mask 扩展部分
+            if attn_mask is not None:
+                B_mask, L_q, L_k = attn_mask.shape[:3]
+                mask_append = torch.zeros(
+                    (B_mask, L_q, tokens_per_frame),
+                    device=attn_mask.device,
+                    dtype=attn_mask.dtype
+                )
+                attn_mask_new = torch.cat([attn_mask, mask_append], dim=-1)
+            else:
+                attn_mask_new = None
+
+            # --- 6. 计算 ---
+            x = attention(
+                roped_query,
+                roped_key,
+                value,
+                attn_mask=attn_mask_new,
+            )
+
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
@@ -312,85 +527,6 @@ class CausalWanSelfAttention(nn.Module):
             k = roped_key.transpose(1, 2)  # [B, N, Lk, D]
             v = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index].transpose(1, 2)
 
-            B, N, Lq, D = q.shape
-            Lk = k.shape[2]
-
-            scale = 1.0 / math.sqrt(D)
-            chunk = 1560 # per frame
-
-            # 在线 softmax 变量
-            m = torch.full((B, N, Lq, 1), -float("inf"), device=q.device, dtype=torch.float32)
-            l = torch.zeros((B, N, Lq, 1), device=q.device, dtype=torch.float32)
-
-            # refresh m & l
-            for s in range(0, Lk, chunk):
-                e = min(s + chunk, Lk)
-                k_chunk = k[:, :, s:e, :]  # [B, N, Ck, D]
-
-                # logits: [B, N, Lq, Ck]
-                scores = torch.einsum("bnqd,bnkd->bnqk", q, k_chunk) * scale
-                scores = scores.float()
-
-                # online softmax
-                m_new = torch.maximum(m, scores.max(dim=-1, keepdim=True).values)
-                exp_scores = torch.exp(scores - m_new)
-                l = l * torch.exp(m - m_new) + exp_scores.sum(dim=-1, keepdim=True)
-                m = m_new
-
-            x_accum = torch.zeros_like(roped_query).transpose(1, 2)
-            # cal real exp_scores
-            for s in range(0, Lk, chunk):
-                e = min(s + chunk, Lk)
-                k_chunk = k[:, :, s:e, :]  # [B, N, Ck, D]
-
-                scores = torch.einsum("bnqd,bnkd->bnqk", q, k_chunk) * scale
-                scores = scores.float()
-
-                # score mask before softmax
-                if self.counter.attn_block_idx in self.head_mask_dict and s == 0:
-                    mask_list = self.head_mask_dict[self.counter.attn_block_idx]
-                    scores[:,mask_list, q.shape[2]-frame_seqlen:q.shape[2],:] = -1e9  # only mask last query token
-                exp_scores = torch.exp(scores - m) / l
-
-                # calculate masked attention
-                value = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-                v_chunk = value[:, s:e].transpose(1,2)  # [B, N, Lv, D]
-                exp_scores = exp_scores.to(v_chunk.dtype)
-                # x_accum += torch.einsum("bnqk,bnkd->bnqd", exp_scores, v_chunk)
-                # score size [B, N, Lq, Lk]
-                if self.counter.head_only is not True:
-                    exp_scores = exp_scores.mean(dim=1)    # n head dim
-                score = exp_scores.sum(dim=-1)    # lk dim
-                score = score.unflatten(-1, (num_new_frames, frame_seqlen)).mean(dim=-1)
-
-                if s < sink_tokens:
-                    key_frame_idx = s // chunk
-                else:
-                    key_frame_idx = (self.evic_keylen + s) // chunk
-
-                query_block_idx = self.counter.video_block_idx
-                query_frame_st = query_block_idx * num_new_frames
-                query_frame_ed = (query_block_idx + 1) * num_new_frames
-
-                if not hasattr(self, "counter"):
-                    break
-
-                score = score.to(cpu)
-                # print(f"time step:{self.counter.time_step}, attn_block:{self.counter.attn_block_idx}")
-                if self.counter.head_only is not True:
-                    self.counter.heatmap[self.counter.time_step][self.counter.attn_block_idx,
-                    0,
-                    key_frame_idx,
-                    query_frame_st:query_frame_ed
-                    ] = score[0]
-                else:
-                    for i, h in enumerate(score[0]):
-                        self.counter.heatmap[self.counter.time_step][self.counter.attn_block_idx,
-                        i,
-                        key_frame_idx,
-                        query_frame_st:query_frame_ed
-                        ] = h
-
             # calcuate mask attenion here
             attn_mask = None
             if self.counter.attn_block_idx in self.head_mask_dict and s == 0:
@@ -403,8 +539,6 @@ class CausalWanSelfAttention(nn.Module):
                     is_causal=False
                 )
             x = x.transpose(1, 2)
-        if hasattr(self, "counter"):
-            self.counter.attn_block_idx += 1
 
         x = x.flatten(2)
         x = self.o(x)
