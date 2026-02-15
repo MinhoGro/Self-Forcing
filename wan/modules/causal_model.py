@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch
 import math
 import torch.distributed as dist
+import torch.nn.functional as F
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -110,6 +111,9 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+        # float tokens
+        self.float_tokens = 3120
 
     def forward(
             self,
@@ -230,6 +234,19 @@ class CausalWanSelfAttention(nn.Module):
             max_attention_frames = self.max_attention_size // frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = max_attention_frames * frame_seqlen  # 32760
+
+            float_k = None
+            float_k_s = None
+            float_v = None
+            float_v_s = None
+            float_frames = 0
+            if current_end > self.float_tokens:
+                float_frames  = self.float_tokens // frame_seqlen
+                float_k = kv_cache["k"][:, -(self.float_tokens-1560):]
+                float_k_s = kv_cache["k"][:,0:1560]
+                float_v = kv_cache["v"][:,-(self.float_tokens-1560):]
+                float_v_s = kv_cache["v"][:,0:1560]
+
             # after 21 frames, we evict, and rotate the cached key from scratch.
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     (num_new_tokens + kv_cache["local_end_index"].item()) > kv_cache_size):
@@ -251,9 +268,11 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["k"][:, local_start_index:local_end_index] = k
                 kv_cache["v"][:, local_start_index:local_end_index] = v
                 k_for_rope = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                if float_k is not None:
+                    k_for_rope = torch.cat([k_for_rope, float_k, float_k_s], dim=1)
                 # ------------------------------------------------------------ #
                 grid_sizes_full = grid_sizes.clone()
-                grid_sizes_full[0][0] = max_attention_frames
+                grid_sizes_full[0][0] = max_attention_frames + float_frames
                 # ------------------------------------------------------------ #
                 scene_cut = kv_cache.get("scene_cut", False)
                 relative_start_frame = max_attention_frames - num_new_frames
@@ -271,9 +290,11 @@ class CausalWanSelfAttention(nn.Module):
                 kv_cache["k"][:, local_start_index:local_end_index] = k
                 kv_cache["v"][:, local_start_index:local_end_index] = v
                 k_for_rope = kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                if float_k is not None:
+                    k_for_rope = torch.cat([k_for_rope, float_k, float_k_s], dim=1)
                 # ------------------------------------------------------------ #
                 grid_sizes_full = grid_sizes.clone()
-                grid_sizes_full[0][0] = min(local_end_index // frame_seqlen, max_attention_frames)
+                grid_sizes_full[0][0] = min(local_end_index // frame_seqlen, max_attention_frames) + float_frames
                 # ------------------------------------------------------------ #
                 scene_cut = kv_cache.get("scene_cut", False)
                 relative_start_frame = current_start_frame if current_start_frame < max_attention_frames else max_attention_frames - num_new_frames
@@ -287,11 +308,39 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][:, :frame_seqlen] = roped_key[:, :frame_seqlen]
                 else:
                     roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
+            value = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            if float_k is not None:
+                value = torch.cat([value, float_v, float_v_s], dim=1)
+
+            # flation action
+            # --- 1. extract float tokens
+            # Shape: [B, float_tokens, H, D]
+            curr_k = k_for_rope[:, -self.float_tokens:]
+            curr_v = value[:, -self.float_tokens:]
+
+            # --- 2. 维度变换 ---
+            q_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
+            k_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
+            v_for_value = curr_v.transpose(1, 2)  # [B, H, 1560, D]
+            v_for_key = curr_k.transpose(1, 2)  # [B, H, 1560, D] (用于平滑 Key 自身)
+
+            # --- 3. 计算平滑 (Flash Attention 加速) ---
+            v_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_value, dropout_p=0.0)
+            k_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_key, dropout_p=0.0)
+
+            # --- 4. 还原维度并写回 ---
+            # [B, H, 1560, D] -> [B, 1560, H, D]
+            curr_k_smooth = k_aligned.transpose(1, 2)
+            curr_v_smooth = v_aligned.transpose(1, 2)
+
+            # 写回 Tensor (In-place 修改)
+            k_for_rope[:, -self.float_tokens:] = curr_k_smooth
+            value[:, -self.float_tokens:] = curr_v_smooth
 
             x = attention(
                 roped_query,
                 roped_key,
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                value
             )
 
             kv_cache["global_end_index"].fill_(current_end)
