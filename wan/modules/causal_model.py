@@ -113,7 +113,7 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         # float tokens
-        self.float_tokens = 3120
+        self.float_tokens = 1560 * 3
 
     def forward(
             self,
@@ -313,29 +313,30 @@ class CausalWanSelfAttention(nn.Module):
                 value = torch.cat([value, float_v, float_v_s], dim=1)
 
             # flation action
-            # --- 1. extract float tokens
-            # Shape: [B, float_tokens, H, D]
-            curr_k = k_for_rope[:, -self.float_tokens:]
-            curr_v = value[:, -self.float_tokens:]
+            if float_k is not None:
+                # --- 1. extract float tokens
+                # Shape: [B, float_tokens, H, D]
+                curr_k = k_for_rope[:, -self.float_tokens:]
+                curr_v = value[:, -self.float_tokens:]
 
-            # --- 2. 维度变换 ---
-            q_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
-            k_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
-            v_for_value = curr_v.transpose(1, 2)  # [B, H, 1560, D]
-            v_for_key = curr_k.transpose(1, 2)  # [B, H, 1560, D] (用于平滑 Key 自身)
+                # --- 2. 维度变换 ---
+                q_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
+                k_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
+                v_for_value = curr_v.transpose(1, 2)  # [B, H, 1560, D]
+                v_for_key = curr_k.transpose(1, 2)  # [B, H, 1560, D] (用于平滑 Key 自身)
 
-            # --- 3. 计算平滑 (Flash Attention 加速) ---
-            v_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_value, dropout_p=0.0)
-            k_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_key, dropout_p=0.0)
+                # --- 3. 计算平滑 (Flash Attention 加速) ---
+                v_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_value, dropout_p=0.0)
+                k_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_key, dropout_p=0.0)
 
-            # --- 4. 还原维度并写回 ---
-            # [B, H, 1560, D] -> [B, 1560, H, D]
-            curr_k_smooth = k_aligned.transpose(1, 2)
-            curr_v_smooth = v_aligned.transpose(1, 2)
+                # --- 4. 还原维度并写回 ---
+                # [B, H, 1560, D] -> [B, 1560, H, D]
+                curr_k_smooth = k_aligned.transpose(1, 2)
+                curr_v_smooth = v_aligned.transpose(1, 2)
 
-            # 写回 Tensor (In-place 修改)
-            k_for_rope[:, -self.float_tokens:] = curr_k_smooth
-            value[:, -self.float_tokens:] = curr_v_smooth
+                # 写回 Tensor (In-place 修改)
+                k_for_rope[:, -self.float_tokens:] = curr_k_smooth
+                value[:, -self.float_tokens:] = curr_v_smooth
 
             x = attention(
                 roped_query,
