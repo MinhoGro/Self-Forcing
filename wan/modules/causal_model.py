@@ -323,19 +323,16 @@ class CausalWanSelfAttention(nn.Module):
                 q_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
                 k_f = curr_k.transpose(1, 2)  # [B, H, 1560, D]
                 v_for_value = curr_v.transpose(1, 2)  # [B, H, 1560, D]
-                v_for_key = curr_k.transpose(1, 2)  # [B, H, 1560, D] (用于平滑 Key 自身)
 
                 # --- 3. 计算平滑 (Flash Attention 加速) ---
                 v_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_value, dropout_p=0.0)
-                k_aligned = F.scaled_dot_product_attention(q_f, k_f, v_for_key, dropout_p=0.0)
 
                 # --- 4. 还原维度并写回 ---
                 # [B, H, 1560, D] -> [B, 1560, H, D]
-                curr_k_smooth = k_aligned.transpose(1, 2)
                 curr_v_smooth = v_aligned.transpose(1, 2)
 
                 # 写回 Tensor (In-place 修改)
-                k_for_rope[:, -self.float_tokens:] = curr_k_smooth
+                # k_for_rope[:, -self.float_tokens:] = curr_k_smooth
                 value[:, -self.float_tokens:] = curr_v_smooth
 
             x = attention(
