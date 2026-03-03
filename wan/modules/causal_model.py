@@ -26,67 +26,8 @@ flex_attention = torch.compile(
 
 import torch
 import matplotlib.pyplot as plt
-import seaborn as sns
+# import seaborn as sns
 import numpy as np
-
-
-def plot_float_frame_attention(attn_probs, batch_idx=0, H=30, W=52):
-    """
-    Args:
-        attn_probs: Tensor of shape [B, num_frames, N, 1560, 1560]
-        batch_idx: 选取的 Batch 索引
-        H, W: Frame 内部的高宽 (30 * 52 = 1560)
-    """
-    num_frames = attn_probs.shape[1]
-
-    # ---------------------------------------------------------
-    # 分析一：全局 Key 重要性 (Global Key Importance)
-    # 看看这一帧中，哪些像素（Key）被所有其他的像素（Query）关注得最多。
-    # 如果背景消失，你应该会看到热力图高度集中在主体上，背景全黑。
-    # ---------------------------------------------------------
-    # 在 Heads (dim=2) 和 Query (dim=3) 上取平均，得到每个 Key 的全局权重
-    global_key_weights = attn_probs[batch_idx].mean(dim=(1, 2))  # Shape: [num_frames, 1560]
-
-    fig, axes = plt.subplots(1, num_frames, figsize=(5 * num_frames, 4))
-    fig.suptitle("Global Key Importance (What the frame is looking at)", fontsize=16)
-
-    for f in range(num_frames):
-        heatmap_2d = global_key_weights[f].view(H, W).numpy()
-        ax = axes[f] if num_frames > 1 else axes
-        sns.heatmap(heatmap_2d, cmap="magma", ax=ax, cbar=False, xticklabels=False, yticklabels=False)
-        ax.set_title(f"Float Frame {f + 1}")
-
-    plt.tight_layout()
-    plt.show()
-
-    # ---------------------------------------------------------
-    # 分析二：特定 Query 的局部关注点 (Specific Query Focus)
-    # 选定画面中心的一个点（通常是主体），看看它的注意力发散到哪里。
-    # ---------------------------------------------------------
-    center_y, center_x = H // 2, W // 2
-    query_idx = center_y * W + center_x
-
-    # 在 Heads (dim=2) 上取平均
-    # Shape: [num_frames, 1560]
-    specific_query_weights = attn_probs[batch_idx, :, :, query_idx, :].mean(dim=1)
-
-    fig, axes = plt.subplots(1, num_frames, figsize=(5 * num_frames, 4))
-    fig.suptitle(f"Attention of Center Query Token (y={center_y}, x={center_x})", fontsize=16)
-
-    for f in range(num_frames):
-        heatmap_2d = specific_query_weights[f].view(H, W).numpy()
-        ax = axes[f] if num_frames > 1 else axes
-        # 这里用 vmax 稍微截断一下极值，让背景细节更清晰
-        vmax = np.percentile(heatmap_2d, 99)
-        sns.heatmap(heatmap_2d, cmap="viridis", ax=ax, vmax=vmax, cbar=False, xticklabels=False, yticklabels=False)
-        # 标记出 Query 所在位置
-        ax.scatter([center_x], [center_y], color='red', marker='x', s=100)
-        ax.set_title(f"Float Frame {f + 1}")
-
-    plt.tight_layout()
-    plt.imsave()
-    plt.close()
-
 
 
 def rope_cut(freqs, start_frame, f, transition_frames=3, transition_from=45):
@@ -177,7 +118,70 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
         # float tokens
-        self.float_tokens = 1560 * 3
+        self.float_tokens = 1560 * 2
+
+    def plot_float_frame_attention(self, attn_probs, batch_idx=0, H=30, W=52):
+        """
+        Args:
+            attn_probs: Tensor of shape [B, num_frames, N, 1560, 1560]
+            batch_idx: 选取的 Batch 索引
+            H, W: Frame 内部的高宽 (30 * 52 = 1560)
+        """
+        num_frames = attn_probs.shape[1]
+
+        # ---------------------------------------------------------
+        # 分析一：全局 Key 重要性 (Global Key Importance)
+        # 看看这一帧中，哪些像素（Key）被所有其他的像素（Query）关注得最多。
+        # 如果背景消失，你应该会看到热力图高度集中在主体上，背景全黑。
+        # ---------------------------------------------------------
+        # 在 Heads (dim=2) 和 Query (dim=3) 上取平均，得到每个 Key 的全局权重
+        global_key_weights = attn_probs[batch_idx].mean(dim=(1, 2))  # Shape: [num_frames, 1560]
+
+        fig, axes = plt.subplots(1, num_frames, figsize=(5 * num_frames, 4))
+        fig.suptitle("Global Key Importance (What the frame is looking at)", fontsize=16)
+
+        for f in range(num_frames):
+            heatmap_2d = global_key_weights[f].view(H, W).numpy()
+            ax = axes[f] if num_frames > 1 else axes
+            sns.heatmap(heatmap_2d, cmap="magma", ax=ax, cbar=False, xticklabels=False, yticklabels=False)
+            ax.set_title(f"Float Frame {f + 1}")
+
+        plt.tight_layout()
+        plt.show()
+
+        # ---------------------------------------------------------
+        # 分析二：特定 Query 的局部关注点 (Specific Query Focus)
+        # 选定画面中心的一个点（通常是主体），看看它的注意力发散到哪里。
+        # ---------------------------------------------------------
+        center_y, center_x = H // 2, W // 2
+        query_idx = center_y * W + center_x
+
+        # 在 Heads (dim=2) 上取平均
+        # Shape: [num_frames, 1560]
+        specific_query_weights = attn_probs[batch_idx, :, :, query_idx, :].mean(dim=1)
+
+        fig, axes = plt.subplots(1, num_frames, figsize=(5 * num_frames, 4))
+        fig.suptitle(f"Attention of Center Query Token (y={center_y}, x={center_x})", fontsize=16)
+
+        for f in range(num_frames):
+            heatmap_2d = specific_query_weights[f].view(H, W).numpy()
+            ax = axes[f] if num_frames > 1 else axes
+            # 这里用 vmax 稍微截断一下极值，让背景细节更清晰
+            vmax = np.percentile(heatmap_2d, 99)
+            sns.heatmap(heatmap_2d, cmap="viridis", ax=ax, vmax=vmax, cbar=False, xticklabels=False, yticklabels=False)
+            # 标记出 Query 所在位置
+            ax.scatter([center_x], [center_y], color='red', marker='x', s=100)
+            ax.set_title(f"Float Frame {f + 1}")
+
+        plt.tight_layout()
+        plt.imsave(
+            fname="atten_time{self.counter.time_step}_frame{self.counter.output_frames}_block{self.counter.attn_block_idx}.png",
+            arr=heatmap_2d,
+            cmap='magma',  # 暗部偏黑紫，亮部偏黄白，非常适合展现注意力坍缩
+            vmin=0,  # 权重下限为 0
+            vmax=np.percentile(heatmap_2d, 99)  # 超过 vmax_val 的权重都会显示为最亮的颜色
+        )
+        plt.close()
 
     def forward(
             self,
@@ -304,24 +308,85 @@ class CausalWanSelfAttention(nn.Module):
             float_v = None
             float_v_s = None
             float_frames = 0
-            if current_end > self.float_tokens:
-                float_frames  = self.float_tokens // frame_seqlen
-                float_k = kv_cache["k"][:, -(self.float_tokens-1560):]
-                float_k_s = kv_cache["k"][:,0:1560]
-                float_v = kv_cache["v"][:,-(self.float_tokens-1560):]
-                float_v_s = kv_cache["v"][:,0:1560]
+            val = None
+            if current_end > 1560 * 3 and self.counter.time_step == 1000:
+                if "k" not in self.counter.sink_tokens and kv_cache is not None:
+                    self.counter.sink_tokens["k"] = kv_cache["k"][:, :(1560 * 1)]
+                    self.counter.sink_tokens["v"] = kv_cache["v"][:, :(1560 * 1)]
 
-                f_q = float_k.transpose(1, 2)
-                f_k = float_k.transpose(1, 2)
-                f_v = float_v.transpose(1, 2)
-                float_v_aligned = F.scaled_dot_product_attention(f_q, f_k, f_v, dropout_p=0.0)
-                float_v = float_v_aligned.transpose(1, 2)
+                if self.counter.sink_tokens["v_cache"] is None:
+                    self.counter.sink_tokens["v_cache"] = kv_cache["v"]
+
+                float_k_1 = kv_cache["k"][:, -self.float_tokens:]
+                # float_k_s = kv_cache["k"][:, :1560]
+                float_k_s = self.counter.sink_tokens["k"]
+                float_v_1 = kv_cache["v"][:, -self.float_tokens:]
+                # float_v_s = kv_cache["v"][:, :1560]
+                float_v_s = self.counter.sink_tokens["v"]
+
+                f_q_s = torch.cat([k], dim=1).transpose(1, 2)
+                f_k_s = torch.cat([kv_cache["k"]], dim=1).transpose(1, 2)
+                f_v_s = torch.cat([kv_cache["v"]], dim=1).transpose(1, 2)
+
+                head_dim = f_q_s.size(-1)
+                T = 7
+                custom_scale = 1.0 / (math.sqrt(head_dim) * T)
+
+                float_v_aligned_s = F.scaled_dot_product_attention(f_q_s, f_k_s, f_v_s, dropout_p=0.0,
+                                                                   scale=custom_scale)
+                float_v_aligned_s = float_v_aligned_s.transpose(1, 2)
+                # val= float_v_aligned_s
+
+                kv_cache["v"][:, -1560 * 3:] = 0.4 * float_v_aligned_s[:, -1560 * 3:] + 0.6 * kv_cache["v"][:, -1560 * 3:]
+                # kv_cache["v"][:, -1560:] = float_v_aligned_s[:, -1560:]
+
+            if self.counter.time_step < 1000 and self.counter.sink_tokens["v_cache"] is not None:
+                kv_cache["v"] = self.counter.sink_tokens["v_cache"]
+                self.counter.sink_tokens["v_cache"] = None
+
+            float_k = None
+            float_k_s = None
+            float_v = None
+            float_v_s = None
+            float_frames = 0
+            if current_end > 1560 * 3 and self.counter.time_step <= 800:
+                if "k" not in self.counter.sink_tokens and kv_cache is not None:
+                    self.counter.sink_tokens["k"] = kv_cache["k"][:, :(1560 * 3)]
+                    self.counter.sink_tokens["v"] = kv_cache["v"][:, :(1560 * 3)]
+                alpha = 0.7
+                float_frames = self.float_tokens // frame_seqlen
+                float_q = q
+                float_k = kv_cache["k"][:, -self.float_tokens:]
+                # float_k_s = kv_cache["k"][:, :1560]
+                float_k_s = self.counter.sink_tokens["k"]
+                float_v = kv_cache["v"][:, -self.float_tokens:]
+                # float_v_s = kv_cache["v"][:, :1560]
+                float_v_s = self.counter.sink_tokens["v"]
+
+                # f_q = float_k.transpose(1, 2)
+                # f_k = float_k.transpose(1, 2)
+                # f_v = float_v.transpose(1, 2)
+                # float_v_aligned = F.scaled_dot_product_attention(f_q, f_k, f_v, dropout_p=0.0)
+                # float_v = float_v * (1-alpha) + alpha * float_v_aligned.transpose(1, 2)
 
                 # f_q_s = float_k_s.transpose(1, 2)
                 # f_k_s = float_k_s.transpose(1, 2)
                 # f_v_s = float_v_s.transpose(1, 2)
                 # float_v_aligned_s = F.scaled_dot_product_attention(f_q_s, f_k_s, f_v_s, dropout_p=0.0)
-                # float_v_s = float_v_aligned_s.transpose(1, 2)
+                # float_v_s = alpha * float_v_s + (1-alpha) * float_v_aligned_s.transpose(1, 2)
+
+                f_q_s = torch.cat([k], dim=1).transpose(1, 2)
+                f_k_s = torch.cat([k, float_k, float_k_s], dim=1).transpose(1, 2)
+                f_v_s = torch.cat([k, float_v, float_v_s], dim=1).transpose(1, 2)
+                float_v_aligned_s = F.scaled_dot_product_attention(f_q_s, f_k_s, f_v_s, dropout_p=0.0)
+                float_v_aligned_s = float_v_aligned_s.transpose(1, 2)
+                # float_v_s = float_v_s * (1-alpha) + alpha * float_v_aligned_s[:, -1560:]
+
+                float_v = float_v_aligned_s[:, (1560 * 0):(1560 * 1)]
+                # float_v = torch.cat([float_v, kv_cache["v"][:,:1560]], dim=1)
+                float_k = f_k_s.transpose(1, 2)[:, (1560 * 0):(1560 * 1)]
+                # float_k = torch.cat([float_k, kv_cache["k"][:,:1560]], dim=1)
+                float_frames = 1
 
             # after 21 frames, we evict, and rotate the cached key from scratch.
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
@@ -348,7 +413,7 @@ class CausalWanSelfAttention(nn.Module):
                     k_for_rope = torch.cat([k_for_rope, float_k], dim=1)
                 # ------------------------------------------------------------ #
                 grid_sizes_full = grid_sizes.clone()
-                grid_sizes_full[0][0] = max_attention_frames + float_frames -1
+                grid_sizes_full[0][0] = max_attention_frames + float_frames
                 # ------------------------------------------------------------ #
                 scene_cut = kv_cache.get("scene_cut", False)
                 relative_start_frame = max_attention_frames - num_new_frames
@@ -370,7 +435,7 @@ class CausalWanSelfAttention(nn.Module):
                     k_for_rope = torch.cat([k_for_rope, float_k], dim=1)
                 # ------------------------------------------------------------ #
                 grid_sizes_full = grid_sizes.clone()
-                grid_sizes_full[0][0] = min(local_end_index // frame_seqlen, max_attention_frames) + float_frames -1
+                grid_sizes_full[0][0] = min(local_end_index // frame_seqlen, max_attention_frames) + float_frames
                 # ------------------------------------------------------------ #
                 scene_cut = kv_cache.get("scene_cut", False)
                 relative_start_frame = current_start_frame if current_start_frame < max_attention_frames else max_attention_frames - num_new_frames
@@ -385,43 +450,43 @@ class CausalWanSelfAttention(nn.Module):
                 else:
                     roped_key[:, :frame_seqlen] = k_for_rope[:, :frame_seqlen]
             value = kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+            if val is not None:
+                value[:, -1560 * 3:] = val[:, -1560 * 3:]
             if float_k is not None:
                 value = torch.cat([value, float_v], dim=1)
 
-            # ========================================== #
-            # [INSERT HERE] 提取 Float Frame Attention Map
-            # ========================================== #
-            if float_k is not None:
-                # 提取最后的 float tokens (3 帧)
-                # roped_query 和 k_for_rope 的 shape 假设为 [B, S, N, D]
-                float_q = roped_query[:, -self.float_tokens:, :, :]
-                float_k = roped_key[:, -self.float_tokens:, :, :]
-
-                B, _, N, D = float_q.shape
-                num_float_frames = self.float_tokens // frame_seqlen  # 3
-
-                # Reshape 按帧拆分: [B, num_float_frames, 1560, N, D]
-                float_q = float_q.view(B, num_float_frames, frame_seqlen, N, D)
-                float_k = float_k.view(B, num_float_frames, frame_seqlen, N, D)
-
-                # 维度转换以计算点积: [B, num_float_frames, N, 1560, D]
-                float_q = float_q.permute(0, 1, 3, 2, 4)
-                float_k = float_k.permute(0, 1, 3, 2, 4)
-
-                # 计算 Raw Attention Weights: Q @ K^T / sqrt(D)
-                # 结果 Shape: [B, num_float_frames, N, 1560 (Query), 1560 (Key)]
-                scale = 1.0 / math.sqrt(D)
-                attn_weights = torch.matmul(float_q, float_k.transpose(-1, -2)) * scale
-
-                # 计算 Softmax 概率
-                attn_probs = F.softmax(attn_weights, dim=-1)
-
-                # 保存为全局变量或落盘，供后续可视化分析 (此处演示直接 detach 并转为 cpu)
-                # 注意：为了避免显存溢出，建议只在特定 timestep 抓取
-                if timestep is not None and timestep.item() == 500:  # 假设你想看 t=500 时的状态
-                    self._debug_float_attn_probs = attn_probs.detach().cpu().float()
-            # ========================================== #
-
+            # # ========================================== #
+            # # [INSERT HERE] 提取 Float Frame Attention Map
+            # # ========================================== #
+            # if float_k is not None:
+            #     # 提取最后的 float tokens (3 帧)
+            #     # roped_query 和 k_for_rope 的 shape 假设为 [B, S, N, D]
+            #     float_q = roped_query[:, -self.float_tokens:, :, :]
+            #     float_k = roped_key[:, -self.float_tokens:, :, :]
+            #
+            #     B, _, N, D = float_q.shape
+            #     num_float_frames = self.float_tokens // frame_seqlen  # 3
+            #
+            #     # Reshape 按帧拆分: [B, num_float_frames, 1560, N, D]
+            #     float_q = float_q.view(B, num_float_frames, frame_seqlen, N, D)
+            #     float_k = float_k.view(B, num_float_frames, frame_seqlen, N, D)
+            #
+            #     # 维度转换以计算点积: [B, num_float_frames, N, 1560, D]
+            #     float_q = float_q.permute(0, 1, 3, 2, 4)
+            #     float_k = float_k.permute(0, 1, 3, 2, 4)
+            #
+            #     # 计算 Raw Attention Weights: Q @ K^T / sqrt(D)
+            #     # 结果 Shape: [B, num_float_frames, N, 1560 (Query), 1560 (Key)]
+            #     scale = 1.0 / math.sqrt(D)
+            #     attn_weights = torch.matmul(float_q, float_k.transpose(-1, -2)) * scale
+            #
+            #     # 计算 Softmax 概率
+            #     attn_probs = F.softmax(attn_weights, dim=-1)
+            #
+            #     # 保存为全局变量或落盘，供后续可视化分析 (此处演示直接 detach 并转为 cpu)
+            #     # 注意：为了避免显存溢出，建议只在特定 timestep 抓取
+            #     if timestep is not None and timestep.item() == 500:  # 假设你想看 t=500 时的状态
+            #         self._debug_float_attn_probs = attn_probs.detach().cpu().float()
 
             # flation action
             # if float_k is not None:
@@ -776,7 +841,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
             else:
                 return ((kv_idx < ends[q_idx]) & (kv_idx >= (ends[q_idx] - local_attn_size * frame_seqlen))) | (
-                            q_idx == kv_idx)
+                        q_idx == kv_idx)
             # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,

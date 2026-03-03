@@ -21,6 +21,8 @@ class Counter:
         self.heatmap = {}
         self.isInference = False
         self.head_only = True
+        self.sink_tokens = {}
+        self.sink_tokens["v_cache"] = None
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
