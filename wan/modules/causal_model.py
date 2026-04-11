@@ -13,9 +13,30 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
 from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import math
 import torch.distributed as dist
+
+# Import float token improvements
+try:
+    from wan.modules.float_token_improvements import (
+        HierarchicalFloatBank,
+        FloatTokenBank,
+        HierarchicalFloatKVBank,
+        FloatKVSlot,
+        FrameQualityScorer,
+        DynamicIntervalScheduler,
+        TemporalCoherenceScorer,
+        ProgressiveBankActivation,
+        get_layer_float_config,
+        create_adaptive_float_token_config,
+        apply_rope_with_float_tokens,
+        causal_rope_apply_with_float_tokens
+    )
+    FLOAT_TOKEN_AVAILABLE = True
+except ImportError:
+    FLOAT_TOKEN_AVAILABLE = False
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -63,7 +84,27 @@ class CausalWanSelfAttention(nn.Module):
                  local_attn_size=-1,
                  sink_size=0,
                  qk_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_float_tokens=False,
+                 use_hierarchical_float_tokens=True,
+                 float_token_num_slots_short=4,
+                 float_token_num_slots_mid=4,
+                 float_token_num_slots_long=4,
+                 float_token_alpha_short=0.3,
+                 float_token_alpha_mid=0.15,
+                 float_token_alpha_long=0.05,
+                 float_token_update_interval_short=1,
+                 float_token_update_interval_mid=30,
+                 float_token_update_interval_long=90,
+                 use_quality_scorer=True,
+                 use_kv_bank_v2=True,
+                 use_dynamic_intervals=False,
+                 use_temporal_coherence=False,
+                 use_progressive_activation=False,
+                 progressive_warmup_frames=300,
+                 coherence_history_size=30,
+                 dynamic_interval_min_factor=0.5,
+                 dynamic_interval_max_factor=3.0):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -75,6 +116,76 @@ class CausalWanSelfAttention(nn.Module):
         self.eps = eps
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
 
+        # Float token configuration
+        self.use_float_tokens = use_float_tokens and FLOAT_TOKEN_AVAILABLE
+        self.use_hierarchical_float_tokens = use_hierarchical_float_tokens
+
+        # Initialize hierarchical float bank if enabled
+        if self.use_float_tokens:
+            if use_hierarchical_float_tokens:
+                self.float_bank = HierarchicalFloatBank(
+                    d_model=dim,
+                    num_slots_short=float_token_num_slots_short,
+                    num_slots_mid=float_token_num_slots_mid,
+                    num_slots_long=float_token_num_slots_long,
+                    alpha_short=float_token_alpha_short,
+                    alpha_mid=float_token_alpha_mid,
+                    alpha_long=float_token_alpha_long,
+                    update_interval_short=float_token_update_interval_short,
+                    update_interval_mid=float_token_update_interval_mid,
+                    update_interval_long=float_token_update_interval_long,
+                    use_quality_scorer=use_quality_scorer
+                )
+                self.num_float_tokens = (float_token_num_slots_short +
+                                         float_token_num_slots_mid +
+                                         float_token_num_slots_long)
+            else:
+                self.float_bank = FloatTokenBank(
+                    num_slots=4,
+                    d_model=dim,
+                    alpha=0.2,
+                    update_interval=1
+                )
+                self.num_float_tokens = 4
+        else:
+            self.float_bank = None
+            self.num_float_tokens = 0
+
+        # Float KV Bank V2 (improved - direct KV storage, no double-projection)
+        self.use_kv_bank_v2 = use_kv_bank_v2
+        if self.use_float_tokens and use_kv_bank_v2:
+            self.float_kv_bank = HierarchicalFloatKVBank(
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                num_slots_short=float_token_num_slots_short,
+                num_slots_mid=float_token_num_slots_mid,
+                num_slots_long=float_token_num_slots_long,
+                alpha_short=float_token_alpha_short,
+                alpha_mid=float_token_alpha_mid,
+                alpha_long=float_token_alpha_long,
+                update_interval_short=float_token_update_interval_short,
+                update_interval_mid=float_token_update_interval_mid,
+                update_interval_long=float_token_update_interval_long,
+                use_quality_scorer=use_quality_scorer,
+                use_temporal_coherence=use_temporal_coherence,
+                use_progressive_activation=use_progressive_activation,
+                use_dynamic_intervals=use_dynamic_intervals,
+                progressive_warmup_frames=progressive_warmup_frames,
+                coherence_history_size=coherence_history_size,
+                dynamic_interval_min_factor=dynamic_interval_min_factor,
+                dynamic_interval_max_factor=dynamic_interval_max_factor,
+                eps=eps
+            )
+        else:
+            self.float_kv_bank = None
+
+        # When V2 KV bank is active, disable V1 float bank to prevent it from injecting
+        # zero-initialized tokens as a fallback
+        if self.use_float_tokens and use_kv_bank_v2 and self.float_bank is not None:
+            # V2 bank takes priority; disable V1 to avoid zero-token injection fallback
+            self.float_bank = None
+            self.num_float_tokens = 0
+
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -82,6 +193,213 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+    def reset_float_bank(self):
+        """重置 float bank 状态，用于新序列开始时"""
+        if self.float_bank is not None:
+            self.float_bank.reset()
+        if self.float_kv_bank is not None:
+            self.float_kv_bank.reset()
+
+    def _update_float_bank_from_evicted_kv(
+        self,
+        evicted_k: torch.Tensor,
+        evicted_v: torch.Tensor,
+        current_tokens: torch.Tensor = None
+    ) -> dict:
+        """
+        从被驱逐的 KV 中更新 float bank
+
+        Args:
+            evicted_k: 被驱逐的 keys [B, num_evicted, num_heads, head_dim]
+            evicted_v: 被驱逐的 values [B, num_evicted, num_heads, head_dim]
+            current_tokens: 当前帧的 tokens（用于质量评分）
+
+        Returns:
+            stats: 更新统计信息
+        """
+        if not self.use_float_tokens or self.float_bank is None:
+            return {}
+
+        # 合并 key 和 value 信息
+        # evicted_k shape: [B, num_evicted, num_heads, head_dim]
+        b, num_evicted, n, d = evicted_k.shape
+
+        # 将多头合并为单个表示
+        # 方法：将 keys 和 values 拼接后池化
+        evicted_kv = torch.cat([evicted_k, evicted_v], dim=-1)  # [B, num_evicted, num_heads, 2*head_dim]
+
+        # 跨头平均池化，然后投影到 d_model
+        evicted_pooled = evicted_kv.mean(dim=2)  # [B, num_evicted, 2*head_dim]
+
+        # 如果维度不匹配，使用线性投影或池化
+        if 2 * d != self.head_dim * 2:
+            # 简单平均
+            evicted_for_bank = evicted_pooled.mean(dim=-1, keepdim=True).expand(-1, -1, self.dim)
+        else:
+            # 扩展以匹配 d_model
+            repeat_factor = self.dim // (2 * d)
+            if repeat_factor > 1:
+                evicted_for_bank = evicted_pooled.repeat(1, 1, repeat_factor)
+            else:
+                # 池化到 d_model
+                evicted_for_bank = F.adaptive_avg_pool1d(
+                    evicted_pooled.transpose(1, 2), self.dim
+                ).transpose(1, 2)
+
+        # 截断或填充到 num_evicted 个 token
+        if evicted_for_bank.shape[1] > num_evicted:
+            evicted_for_bank = evicted_for_bank[:, :num_evicted]
+
+        # 更新 float bank
+        stats = self.float_bank.update(evicted_for_bank, current_tokens)
+        return stats
+
+    def _update_float_bank_from_evicted(
+        self,
+        kv_cache: dict,
+        num_evicted_tokens: int,
+        current_tokens: torch.Tensor = None
+    ) -> dict:
+        """
+        从被驱逐的 tokens 中更新 float bank
+
+        Args:
+            kv_cache: KV cache 字典
+            num_evicted_tokens: 被驱逐的 token 数量
+            current_tokens: 当前帧的 tokens（用于质量评分）
+
+        Returns:
+            stats: 更新统计信息
+        """
+        if not self.use_float_tokens or self.float_bank is None or num_evicted_tokens <= 0:
+            return {}
+
+        # 获取被驱逐的 key tokens（从 sink 之后的位置）
+        sink_tokens = self.sink_size * (kv_cache["k"].shape[1] // self.local_attn_size if self.local_attn_size > 0 else 1560)
+        evicted_start = sink_tokens
+        evicted_end = sink_tokens + num_evicted_tokens
+
+        # 提取被驱逐的 key 值
+        evicted_keys = kv_cache["k"][:, evicted_start:evicted_end]  # [B, num_evicted, num_heads, head_dim]
+
+        # 转换为 float bank 期望的格式 [B, num_evicted, dim]
+        b, num_evicted, n, d = evicted_keys.shape
+        evicted_flat = evicted_keys.transpose(1, 2).reshape(b, n, num_evicted * d)
+
+        # 投影到 d_model 维度（如果需要）
+        if num_evicted * d != self.dim:
+            # 使用平均池化
+            evicted_pooled = evicted_keys.mean(dim=2)  # [B, num_evicted, head_dim]
+            # 扩展或池化到 num_evicted_tokens 个 token，每个 d_model 维度
+            evicted_for_bank = evicted_pooled.reshape(b, num_evicted, d).repeat(1, 1, self.num_heads)
+        else:
+            evicted_for_bank = evicted_flat
+
+        # 更新 float bank
+        stats = self.float_bank.update(evicted_for_bank, current_tokens)
+        return stats
+
+    def _prepare_qkv_with_float_tokens(
+        self,
+        x: torch.Tensor,
+        b: int,
+        s: int
+    ) -> tuple:
+        """
+        准备包含 float tokens 的 QKV
+
+        Args:
+            x: 输入特征 [B, S, C]
+            b: batch size
+            s: sequence length (不包括 float tokens)
+
+        Returns:
+            q, k, v: query, key, value tensors
+            num_original_tokens: 原始 token 数量
+        """
+        if not self.use_float_tokens or self.float_bank is None:
+            # 标准 QKV 计算
+            q = self.norm_q(self.q(x)).view(b, s, self.num_heads, self.head_dim)
+            k = self.norm_k(self.k(x)).view(b, s, self.num_heads, self.head_dim)
+            v = self.v(x).view(b, s, self.num_heads, self.head_dim)
+            return q, k, v, s
+
+        # 获取 float tokens
+        float_tokens = self.float_bank.get_all_tokens()  # [num_float_tokens, dim]
+        num_float_tokens = float_tokens.shape[0]
+
+        # 扩展 float tokens 到 batch 维度
+        float_tokens_expanded = float_tokens.unsqueeze(0).expand(b, -1, -1)  # [B, num_float_tokens, dim]
+
+        # 拼接 float tokens 到输入
+        x_with_float = torch.cat([float_tokens_expanded, x], dim=1)  # [B, num_float_tokens + S, dim]
+
+        # 计算 QKV
+        q_full = self.norm_q(self.q(x_with_float)).view(b, num_float_tokens + s, self.num_heads, self.head_dim)
+        k_full = self.norm_k(self.k(x_with_float)).view(b, num_float_tokens + s, self.num_heads, self.head_dim)
+        v_full = self.v(x_with_float).view(b, num_float_tokens + s, self.num_heads, self.head_dim)
+
+        # Query 包含 float tokens（让它们可以 attend to everything）
+        # 但 Key/Value 的 float tokens 部分只用于 attention
+        return q_full, k_full, v_full, s
+
+    def _apply_rope_with_float_tokens(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        freqs: torch.Tensor,
+        start_frame: int = 0
+    ) -> tuple:
+        """
+        对 QK 应用 RoPE，正确处理 float tokens 的位置编码
+
+        Args:
+            q: query [B, S, num_heads, head_dim]
+            k: key [B, S, num_heads, head_dim]
+            grid_sizes: 网格尺寸 [B, 3]
+            freqs: RoPE 频率
+            start_frame: 当前 block 的起始帧
+
+        Returns:
+            roped_q, roped_k: 应用 RoPE 后的 QK
+        """
+        if not self.use_float_tokens or self.num_float_tokens == 0:
+            # 标准 RoPE
+            roped_q = causal_rope_apply(q, grid_sizes, freqs, start_frame).type_as(q)
+            roped_k = causal_rope_apply(k, grid_sizes, freqs, start_frame).type_as(k)
+            return roped_q, roped_k
+
+        # 分离 float tokens 和普通帧
+        num_total = q.shape[1]
+        num_frames_tokens = num_total - self.num_float_tokens
+
+        q_float = q[:, :self.num_float_tokens]  # [B, num_float_tokens, num_heads, head_dim]
+        q_frames = q[:, self.num_float_tokens:]  # [B, num_frames_tokens, num_heads, head_dim]
+
+        k_float = k[:, :self.num_float_tokens]
+        k_frames = k[:, self.num_float_tokens:]
+
+        # 普通帧：正常 RoPE
+        roped_q_frames = causal_rope_apply(q_frames, grid_sizes, freqs, start_frame).type_as(q)
+        roped_k_frames = causal_rope_apply(k_frames, grid_sizes, freqs, start_frame).type_as(k)
+
+        # Float tokens：锚定在当前 block 起点（start_frame=0）
+        # 为 float tokens 创建虚拟的 grid_sizes（1帧，最小空间尺寸）
+        float_grid_sizes = torch.ones_like(grid_sizes)
+        float_grid_sizes[:, 0] = 1  # 1 frame
+        float_grid_sizes[:, 1] = 1  # 1 height
+        float_grid_sizes[:, 2] = 1  # 1 width
+
+        roped_q_float = causal_rope_apply(q_float, float_grid_sizes, freqs, start_frame=0).type_as(q)
+        roped_k_float = causal_rope_apply(k_float, float_grid_sizes, freqs, start_frame=0).type_as(k)
+
+        # 拼接
+        roped_q = torch.cat([roped_q_float, roped_q_frames], dim=1)
+        roped_k = torch.cat([roped_k_float, roped_k_frames], dim=1)
+
+        return roped_q, roped_k
 
     def forward(
         self,
@@ -116,80 +434,70 @@ class CausalWanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         if kv_cache is None:
-            # if it is teacher forcing training?
-            is_tf = (s == seq_lens[0].item() * 2)
-            if is_tf:
-                q_chunk = torch.chunk(q, 2, dim=1)
-                k_chunk = torch.chunk(k, 2, dim=1)
-                roped_query = []
-                roped_key = []
-                # rope should be same for clean and noisy parts
-                for ii in range(2):
-                    rq = rope_apply(q_chunk[ii], grid_sizes, freqs).type_as(v)
-                    rk = rope_apply(k_chunk[ii], grid_sizes, freqs).type_as(v)
-                    roped_query.append(rq)
-                    roped_key.append(rk)
+            # Training mode
+            # Check if we should use float tokens in training
+            use_float_in_train = self.use_float_tokens and self.float_bank is not None
+            num_original_tokens = s
 
-                roped_query = torch.cat(roped_query, dim=1)
-                roped_key = torch.cat(roped_key, dim=1)
-
-                padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
-                padded_roped_query = torch.cat(
-                    [roped_query,
-                     torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
-                                 device=q.device, dtype=v.dtype)],
-                    dim=1
+            if use_float_in_train:
+                # Prepare QKV with float tokens
+                q, k, v, num_original_tokens = self._prepare_qkv_with_float_tokens(x, b, s)
+                # Apply RoPE with special handling for float tokens
+                roped_query, roped_key = self._apply_rope_with_float_tokens(
+                    q, k, grid_sizes, freqs, start_frame=0
                 )
-
-                padded_roped_key = torch.cat(
-                    [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
-                                            device=k.device, dtype=v.dtype)],
-                    dim=1
-                )
-
-                padded_v = torch.cat(
-                    [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
-                                    device=v.device, dtype=v.dtype)],
-                    dim=1
-                )
-
-                x = flex_attention(
-                    query=padded_roped_query.transpose(2, 1),
-                    key=padded_roped_key.transpose(2, 1),
-                    value=padded_v.transpose(2, 1),
-                    block_mask=block_mask
-                )[:, :, :-padded_length].transpose(2, 1)
-
             else:
-                roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-                roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+                # if it is teacher forcing training?
+                is_tf = (s == seq_lens[0].item() * 2)
+                if is_tf:
+                    q_chunk = torch.chunk(q, 2, dim=1)
+                    k_chunk = torch.chunk(k, 2, dim=1)
+                    roped_query = []
+                    roped_key = []
+                    # rope should be same for clean and noisy parts
+                    for ii in range(2):
+                        rq = rope_apply(q_chunk[ii], grid_sizes, freqs).type_as(v)
+                        rk = rope_apply(k_chunk[ii], grid_sizes, freqs).type_as(v)
+                        roped_query.append(rq)
+                        roped_key.append(rk)
 
-                padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
-                padded_roped_query = torch.cat(
-                    [roped_query,
-                     torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
-                                 device=q.device, dtype=v.dtype)],
-                    dim=1
-                )
+                    roped_query = torch.cat(roped_query, dim=1)
+                    roped_key = torch.cat(roped_key, dim=1)
+                else:
+                    roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
+                    roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
 
-                padded_roped_key = torch.cat(
-                    [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
-                                            device=k.device, dtype=v.dtype)],
-                    dim=1
-                )
+            # Padding for flex_attention
+            padded_length = math.ceil(roped_query.shape[1] / 128) * 128 - roped_query.shape[1]
+            padded_roped_query = torch.cat(
+                [roped_query,
+                 torch.zeros([roped_query.shape[0], padded_length, roped_query.shape[2], roped_query.shape[3]],
+                             device=roped_query.device, dtype=v.dtype)],
+                dim=1
+            )
 
-                padded_v = torch.cat(
-                    [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
-                                    device=v.device, dtype=v.dtype)],
-                    dim=1
-                )
+            padded_roped_key = torch.cat(
+                [roped_key, torch.zeros([roped_key.shape[0], padded_length, roped_key.shape[2], roped_key.shape[3]],
+                                        device=roped_key.device, dtype=v.dtype)],
+                dim=1
+            )
 
-                x = flex_attention(
-                    query=padded_roped_query.transpose(2, 1),
-                    key=padded_roped_key.transpose(2, 1),
-                    value=padded_v.transpose(2, 1),
-                    block_mask=block_mask
-                )[:, :, :-padded_length].transpose(2, 1)
+            padded_v = torch.cat(
+                [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
+                                device=v.device, dtype=v.dtype)],
+                dim=1
+            )
+
+            x = flex_attention(
+                query=padded_roped_query.transpose(2, 1),
+                key=padded_roped_key.transpose(2, 1),
+                value=padded_v.transpose(2, 1),
+                block_mask=block_mask
+            )[:, :, :-padded_length].transpose(2, 1)
+
+            # Remove float tokens from output if used
+            if use_float_in_train and x.shape[1] > num_original_tokens:
+                x = x[:, -num_original_tokens:]
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
@@ -203,34 +511,108 @@ class CausalWanSelfAttention(nn.Module):
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
+            num_evicted_tokens = 0
+            # Check if we need to use sliding window:
+            # 1. local_attn_size is enabled
+            # 2. current_end exceeds global_end_index (new tokens are being added)
+            # 3. Either local_end_index would exceed kv_cache_size, OR current_end already exceeds kv_cache_size
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-                # Calculate the number of new tokens added in this step
-                # Shift existing cache content left to discard oldest tokens
-                # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                # Insert the new keys/values at the end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
-                local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size or current_end > kv_cache_size):
+                
+                # Special case: if current_end exceeds kv_cache_size by a large margin,
+                # we need to handle this differently - just write to the end of cache
+                if current_end > kv_cache_size and kv_cache["local_end_index"].item() == 0:
+                    # First time with a large current_start, just write at the end
+                    local_end_index = min(num_new_tokens, kv_cache_size)
+                    local_start_index = 0
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
+                else:
+                    # Normal sliding window case
+                    # Calculate the number of new tokens added in this step
+                    # Shift existing cache content left to discard oldest tokens
+                    # Clone the source slice to avoid overlapping memory error
+                    num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
+                    num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+
+                    # Update float bank from evicted tokens (if enabled)
+                    if self.use_float_tokens and self.float_bank is not None and num_evicted_tokens > 0:
+                        # Extract evicted tokens from KV cache before overwriting
+                        evicted_k = kv_cache["k"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        evicted_v = kv_cache["v"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        # Update float bank
+                        self._update_float_bank_from_evicted_kv(evicted_k, evicted_v, x)
+
+                    # Update Float KV Bank V2 from evicted tokens
+                    if self.use_float_tokens and self.float_kv_bank is not None and num_evicted_tokens > 0:
+                        evicted_k_v2 = kv_cache["k"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        evicted_v_v2 = kv_cache["v"][:, sink_tokens + num_rolled_tokens:sink_tokens + num_rolled_tokens + num_evicted_tokens].clone()
+                        self.float_kv_bank.update(evicted_k_v2, evicted_v_v2, x)
+
+                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                    # Insert the new keys/values at the end
+                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
+                        kv_cache["global_end_index"].item() - num_evicted_tokens
+
+                    # Clamp indices to valid range to prevent out-of-bounds access
+                    local_end_index = max(0, min(local_end_index, kv_cache_size))
+                    # Recompute local_start_index based on clamped local_end_index
+                    local_start_index = max(0, local_end_index - num_new_tokens)
+
+                    kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                    kv_cache["v"][:, local_start_index:local_end_index] = v
             else:
                 # Assign new keys/values directly up to current_end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
+
+                # Clamp indices to valid range to prevent out-of-bounds access
+                local_end_index = max(0, min(local_end_index, kv_cache_size))
+                # Recompute local_start_index based on clamped local_end_index
+                local_start_index = max(0, local_end_index - num_new_tokens)
+
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = attention(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
+
+            # Attention - inject float KV tokens for long-range consistency
+            kv_start = max(0, local_end_index - self.max_attention_size)
+            cached_k = kv_cache["k"][:, kv_start:local_end_index]
+            cached_v = kv_cache["v"][:, kv_start:local_end_index]
+
+            if self.use_float_tokens and self.float_kv_bank is not None and self.float_kv_bank.is_ready():
+                # V2: Direct KV injection - no double-projection, no RoPE on float tokens
+                float_k, float_v = self.float_kv_bank.get_all_kv()  # [K, H, D]
+                float_k_batch = float_k.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
+                float_v_batch = float_v.unsqueeze(0).expand(b, -1, -1, -1)  # [B, K, H, D]
+                # Scale normalization: match float token scale to cached token scale
+                # This prevents float tokens from dominating attention due to magnitude differences
+                cached_k_scale = cached_k.norm(dim=-1, keepdim=True).mean() + 1e-6
+                float_k_scale = float_k_batch.norm(dim=-1, keepdim=True).mean() + 1e-6
+                scale_ratio = (cached_k_scale / float_k_scale).clamp(0.1, 10.0)
+                float_k_batch = float_k_batch * scale_ratio
+                # Float tokens are position-agnostic: no RoPE applied
+                full_k = torch.cat([float_k_batch.type_as(cached_k), cached_k], dim=1)
+                full_v = torch.cat([float_v_batch.type_as(cached_v), cached_v], dim=1)
+                x = attention(roped_query, full_k, full_v)
+            elif self.use_float_tokens and self.float_bank is not None:
+                # V1 fallback: old path (kept for compatibility)
+                float_tokens = self.float_bank.get_all_tokens()
+                num_float_tokens = float_tokens.shape[0]
+                float_tokens_expanded = float_tokens.unsqueeze(0).expand(b, -1, -1)
+                float_k = self.norm_k(self.k(float_tokens_expanded)).view(b, num_float_tokens, n, d)
+                float_v = self.v(float_tokens_expanded).view(b, num_float_tokens, n, d)
+                float_grid_sizes = torch.ones_like(grid_sizes)
+                float_grid_sizes[:, 0] = 1
+                float_grid_sizes[:, 1:] = 1
+                roped_float_k = causal_rope_apply(float_k, float_grid_sizes, freqs, start_frame=0).type_as(v)
+                full_k = torch.cat([roped_float_k, cached_k], dim=1)
+                full_v = torch.cat([float_v.type_as(v), cached_v], dim=1)
+                x = attention(roped_query, full_k, full_v)
+            else:
+                x = attention(roped_query, cached_k, cached_v)
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
@@ -251,7 +633,28 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_float_tokens=False,
+                 use_hierarchical_float_tokens=True,
+                 float_token_num_slots_short=4,
+                 float_token_num_slots_mid=4,
+                 float_token_num_slots_long=4,
+                 float_token_alpha_short=0.3,
+                 float_token_alpha_mid=0.15,
+                 float_token_alpha_long=0.05,
+                 float_token_update_interval_short=1,
+                 float_token_update_interval_mid=30,
+                 float_token_update_interval_long=90,
+                 use_quality_scorer=True,
+                 use_kv_bank_v2=True,
+                 layer_idx=0,
+                 use_dynamic_intervals=False,
+                 use_temporal_coherence=False,
+                 use_progressive_activation=False,
+                 progressive_warmup_frames=300,
+                 coherence_history_size=30,
+                 dynamic_interval_min_factor=0.5,
+                 dynamic_interval_max_factor=3.0):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -260,10 +663,33 @@ class CausalWanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.layer_idx = layer_idx
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(
+            dim, num_heads, local_attn_size, sink_size, qk_norm, eps,
+            use_float_tokens=use_float_tokens,
+            use_hierarchical_float_tokens=use_hierarchical_float_tokens,
+            float_token_num_slots_short=float_token_num_slots_short,
+            float_token_num_slots_mid=float_token_num_slots_mid,
+            float_token_num_slots_long=float_token_num_slots_long,
+            float_token_alpha_short=float_token_alpha_short,
+            float_token_alpha_mid=float_token_alpha_mid,
+            float_token_alpha_long=float_token_alpha_long,
+            float_token_update_interval_short=float_token_update_interval_short,
+            float_token_update_interval_mid=float_token_update_interval_mid,
+            float_token_update_interval_long=float_token_update_interval_long,
+            use_quality_scorer=use_quality_scorer,
+            use_kv_bank_v2=use_kv_bank_v2,
+            use_dynamic_intervals=use_dynamic_intervals,
+            use_temporal_coherence=use_temporal_coherence,
+            use_progressive_activation=use_progressive_activation,
+            progressive_warmup_frames=progressive_warmup_frames,
+            coherence_history_size=coherence_history_size,
+            dynamic_interval_min_factor=dynamic_interval_min_factor,
+            dynamic_interval_max_factor=dynamic_interval_max_factor
+        )
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -394,7 +820,29 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 use_float_tokens=False,
+                 use_hierarchical_float_tokens=True,
+                 float_token_num_slots_short=4,
+                 float_token_num_slots_mid=4,
+                 float_token_num_slots_long=4,
+                 float_token_alpha_short=0.3,
+                 float_token_alpha_mid=0.15,
+                 float_token_alpha_long=0.05,
+                 float_token_update_interval_short=1,
+                 float_token_update_interval_mid=30,
+                 float_token_update_interval_long=90,
+                 use_quality_scorer=True,
+                 use_kv_bank_v2=True,
+                 use_layer_adaptive_float_tokens=False,
+                 layer_config_preset='memory_efficient',
+                 use_dynamic_intervals=False,
+                 use_temporal_coherence=False,
+                 use_progressive_activation=False,
+                 progressive_warmup_frames=300,
+                 coherence_history_size=30,
+                 dynamic_interval_min_factor=0.5,
+                 dynamic_interval_max_factor=3.0):
         r"""
         Initialize the diffusion model backbone.
 
@@ -431,6 +879,36 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Enable cross-attention normalization
             eps (`float`, *optional*, defaults to 1e-6):
                 Epsilon value for normalization layers
+            use_float_tokens (`bool`, *optional*, defaults to False):
+                Enable float token mechanism for better long-term consistency
+            use_hierarchical_float_tokens (`bool`, *optional*, defaults to True):
+                Use hierarchical float tokens (short/mid/long term)
+            float_token_num_slots_short/mid/long (`int`, *optional*, defaults to 4):
+                Number of float token slots for each time scale
+            float_token_alpha_short/mid/long (`float`, *optional*):
+                EMA update coefficient for each time scale
+            float_token_update_interval_short/mid/long (`int`, *optional*):
+                Update interval (in frames) for each time scale
+            use_quality_scorer (`bool`, *optional*, defaults to True):
+                Enable quality-based filtering for float token updates
+            use_layer_adaptive_float_tokens (`bool`, *optional*, defaults to False):
+                Enable layer-adaptive float token configuration
+            layer_config_preset (`str`, *optional*, defaults to 'memory_efficient'):
+                Layer configuration preset ('memory_efficient' or 'uniform')
+            use_dynamic_intervals (`bool`, *optional*, defaults to False):
+                Enable dynamic update intervals based on content stability
+            use_temporal_coherence (`bool`, *optional*, defaults to False):
+                Enable temporal coherence scoring for multi-frame consistency
+            use_progressive_activation (`bool`, *optional*, defaults to False):
+                Enable progressive activation of long-term float tokens
+            progressive_warmup_frames (`int`, *optional*, defaults to 300):
+                Number of frames for progressive warmup
+            coherence_history_size (`int`, *optional*, defaults to 30):
+                Size of coherence history buffer
+            dynamic_interval_min_factor (`float`, *optional*, defaults to 0.5):
+                Minimum interval factor for dynamic intervals
+            dynamic_interval_max_factor (`float`, *optional*, defaults to 3.0):
+                Maximum interval factor for dynamic intervals
         """
 
         super().__init__()
@@ -453,6 +931,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
+        # Float token configuration
+        self.use_float_tokens = use_float_tokens
+        self.use_hierarchical_float_tokens = use_hierarchical_float_tokens
+
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -467,11 +949,49 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
-        self.blocks = nn.ModuleList([
-            CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
-            for _ in range(num_layers)
-        ])
+        
+        # Build blocks with optional layer-adaptive configuration
+        blocks = []
+        for layer_idx in range(num_layers):
+            # Get layer-specific config if adaptive mode is enabled
+            if use_layer_adaptive_float_tokens and FLOAT_TOKEN_AVAILABLE:
+                layer_config = get_layer_float_config(layer_idx, num_layers, layer_config_preset)
+                layer_short = layer_config['short']
+                layer_mid = layer_config['mid']
+                layer_long = layer_config['long']
+            else:
+                layer_short = float_token_num_slots_short
+                layer_mid = float_token_num_slots_mid
+                layer_long = float_token_num_slots_long
+            
+            blocks.append(
+                CausalWanAttentionBlock(
+                    cross_attn_type, dim, ffn_dim, num_heads,
+                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
+                    use_float_tokens=use_float_tokens,
+                    use_hierarchical_float_tokens=use_hierarchical_float_tokens,
+                    float_token_num_slots_short=layer_short,
+                    float_token_num_slots_mid=layer_mid,
+                    float_token_num_slots_long=layer_long,
+                    float_token_alpha_short=float_token_alpha_short,
+                    float_token_alpha_mid=float_token_alpha_mid,
+                    float_token_alpha_long=float_token_alpha_long,
+                    float_token_update_interval_short=float_token_update_interval_short,
+                    float_token_update_interval_mid=float_token_update_interval_mid,
+                    float_token_update_interval_long=float_token_update_interval_long,
+                    use_quality_scorer=use_quality_scorer,
+                    use_kv_bank_v2=use_kv_bank_v2,
+                    layer_idx=layer_idx,
+                    use_dynamic_intervals=use_dynamic_intervals,
+                    use_temporal_coherence=use_temporal_coherence,
+                    use_progressive_activation=use_progressive_activation,
+                    progressive_warmup_frames=progressive_warmup_frames,
+                    coherence_history_size=coherence_history_size,
+                    dynamic_interval_min_factor=dynamic_interval_min_factor,
+                    dynamic_interval_max_factor=dynamic_interval_max_factor
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
 
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
@@ -944,6 +1464,30 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
+        # Initialize float banks for training if enabled
+        if self.use_float_tokens:
+            self.reset_float_banks()
+            # Process frames to populate float banks (simulating eviction updates)
+            # We do this by processing each frame's tokens
+            num_frames = grid_sizes[0][0].item()
+            frame_seqlen = seq_lens[0].item() // num_frames
+
+            with torch.no_grad():
+                for frame_idx in range(num_frames):
+                    frame_start = frame_idx * frame_seqlen
+                    frame_end = frame_start + frame_seqlen
+                    # Get current frame's tokens
+                    frame_tokens = x[:, frame_start:frame_end, :]
+                    # Update float banks for each block
+                    for block in self.blocks:
+                        if hasattr(block.self_attn, 'float_bank') and block.self_attn.float_bank is not None:
+                            # Simulate eviction update
+                            bank = block.self_attn.float_bank
+                            if hasattr(bank, 'update'):
+                                # Create pseudo-evicted tokens (use frame mean)
+                                pseudo_evicted = frame_tokens.mean(dim=1, keepdim=True).expand(-1, frame_seqlen // 4, -1)
+                                bank.update(pseudo_evicted, frame_tokens)
+
         if clean_x is not None:
             clean_x = [self.patch_embedding(u.unsqueeze(0)) for u in clean_x]
             clean_x = [u.flatten(2).transpose(1, 2) for u in clean_x]
@@ -1032,6 +1576,28 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
             out.append(u)
         return out
+
+    def reset_float_banks(self):
+        """Reset float banks in all attention blocks"""
+        if self.use_float_tokens:
+            for block in self.blocks:
+                if hasattr(block.self_attn, 'reset_float_bank'):
+                    block.self_attn.reset_float_bank()
+    
+    def step_float_banks(self, num_frames: int = 1):
+        """
+        Step float banks for progressive activation.
+        Should be called after processing each frame during inference.
+        
+        Args:
+            num_frames: Number of frames to advance
+        """
+        if self.use_float_tokens:
+            for block in self.blocks:
+                if hasattr(block.self_attn, 'float_kv_bank') and block.self_attn.float_kv_bank is not None:
+                    float_bank = block.self_attn.float_kv_bank
+                    if hasattr(float_bank, 'step'):
+                        float_bank.step(num_frames)
 
     def init_weights(self):
         r"""
